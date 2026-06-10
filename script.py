@@ -108,18 +108,85 @@ def log_stage(name: str):
         logger.info("[DONE]  %s (%.2fs)", name, time.perf_counter() - t0)
 
 
-def load_or_generate(comm_path: str | None, purch_path: str | None):
+# Only the columns the model actually needs are read from disk. Enriched
+# exports often carry dozens of extra columns and millions of rows; reading the
+# whole file is the usual cause of the loader stalling / running out of memory.
+COMM_DATE_COLS = ["mailing_date", "open_date", "click_date"]
+COMM_NUM_COLS = [DISCOUNT_COL, "claim_sum_usd", "adult", "pax"]
+COMM_CAT_COLS = ["mailing_name", "state_name"]
+COMM_NEEDED = ["email"] + COMM_DATE_COLS + COMM_NUM_COLS + COMM_CAT_COLS
+
+PURCH_DATE_COLS = ["date_booking"]
+PURCH_NUM_COLS = ["claim_sum_usd", "adult", "pax"]
+PURCH_CAT_COLS = ["state_name"]
+PURCH_NEEDED = ["email"] + PURCH_DATE_COLS + PURCH_NUM_COLS + PURCH_CAT_COLS
+
+
+def _dtype_map(num_cols, cat_cols):
+    # email stays object (high cardinality -> category union across chunks is
+    # costly and complicates merges); low-cardinality strings -> category.
+    dmap = {c: "float32" for c in num_cols}
+    dmap.update({c: "category" for c in cat_cols})
+    dmap["email"] = "object"
+    return dmap
+
+
+def read_csv_optimized(path, needed, date_cols, num_cols, cat_cols,
+                       chunksize=1_000_000, sep=","):
+    """Memory-friendly CSV reader.
+
+    - reads ONLY the needed columns (``usecols``) -> skips enriched extras;
+    - applies compact dtypes (float32 / category) to cut memory;
+    - parses just the required date columns;
+    - streams in chunks so peak memory stays bounded, logging progress.
+    """
+    logger.info("reading %s (only %d needed columns, chunksize=%d) ...",
+                os.path.basename(path), len(needed), chunksize)
+    dmap = _dtype_map(num_cols, cat_cols)  # dates parsed separately, not here
+
+    parts, total = [], 0
+    reader = pd.read_csv(
+        path, sep=sep,
+        usecols=lambda c: c in set(needed),
+        dtype=dmap,
+        chunksize=chunksize,
+        low_memory=False,
+    )
+    for i, ch in enumerate(reader, 1):
+        for dc in date_cols:
+            if dc in ch.columns:
+                ch[dc] = pd.to_datetime(ch[dc], errors="coerce")
+        parts.append(ch)
+        total += len(ch)
+        logger.info("  chunk %d: +%d rows (total=%d)", i, len(ch), total)
+
+    if not parts:
+        raise ValueError(f"{path} produced no rows.")
+    df = parts[0] if len(parts) == 1 else pd.concat(parts, ignore_index=True)
+    mem_mb = df.memory_usage(deep=True).sum() / 1e6
+    logger.info("read done: %s, ~%.0f MB in memory", df.shape, mem_mb)
+    return df
+
+
+def load_or_generate(comm_path: str | None, purch_path: str | None,
+                     sep: str = ",", chunksize: int = 1_000_000):
     if comm_path and purch_path and os.path.exists(comm_path) and os.path.exists(purch_path):
         logger.info("Loading real data: comm=%s, purch=%s", comm_path, purch_path)
-        comm = pd.read_csv(comm_path)
-        purch = pd.read_csv(purch_path)
+        _check_columns_exist(comm_path, COMM_NEEDED, "communications", sep)
+        _check_columns_exist(purch_path, PURCH_NEEDED, "purchases", sep)
+        comm = read_csv_optimized(comm_path, COMM_NEEDED, COMM_DATE_COLS,
+                                  COMM_NUM_COLS, COMM_CAT_COLS, chunksize, sep)
+        purch = read_csv_optimized(purch_path, PURCH_NEEDED, PURCH_DATE_COLS,
+                                   PURCH_NUM_COLS, PURCH_CAT_COLS, chunksize, sep)
     else:
         default_comm = os.path.join(DATA_DIR, "communications.csv")
         default_purch = os.path.join(DATA_DIR, "purchases.csv")
         if os.path.exists(default_comm) and os.path.exists(default_purch):
             logger.info("Loading cached synthetic data from ./%s", DATA_DIR)
-            comm = pd.read_csv(default_comm)
-            purch = pd.read_csv(default_purch)
+            comm = read_csv_optimized(default_comm, COMM_NEEDED, COMM_DATE_COLS,
+                                      COMM_NUM_COLS, COMM_CAT_COLS, chunksize, sep)
+            purch = read_csv_optimized(default_purch, PURCH_NEEDED, PURCH_DATE_COLS,
+                                       PURCH_NUM_COLS, PURCH_CAT_COLS, chunksize, sep)
         else:
             logger.warning("No data files found -> generating synthetic dataset "
                            "(same schema). Pass --comm/--purch to use real data.")
@@ -128,31 +195,22 @@ def load_or_generate(comm_path: str | None, purch_path: str | None):
             comm.to_csv(default_comm, index=False)
             purch.to_csv(default_purch, index=False)
     logger.info("Loaded communications=%s, purchases=%s", comm.shape, purch.shape)
-    _validate_schema(comm, purch)
     return comm, purch
 
 
-REQUIRED_COMM_COLS = [
-    "email", "mailing_name", "mailing_date", "open_date", "click_date",
-    "purchase_date", "trip_date", DISCOUNT_COL, "claim_sum_usd", "adult",
-    "pax", "state_name",
-]
-REQUIRED_PURCH_COLS = [
-    "email", "date_booking", "date_begin", "claim_sum_usd", "adult",
-    "pax", "state_name",
-]
-
-
-def _validate_schema(comm: pd.DataFrame, purch: pd.DataFrame) -> None:
-    """Fail early with a clear message if the input columns do not match the
-    expected schema (the most common real-data error)."""
-    miss_c = [c for c in REQUIRED_COMM_COLS if c not in comm.columns]
-    miss_p = [c for c in REQUIRED_PURCH_COLS if c not in purch.columns]
-    if miss_c:
-        raise ValueError(f"communications table is missing columns: {miss_c}")
-    if miss_p:
-        raise ValueError(f"purchases table is missing columns: {miss_p}")
-    logger.info("Schema validation passed (comm + purchases columns OK).")
+def _check_columns_exist(path, needed, label, sep=","):
+    """Read only the header to fail fast (and clearly) on schema mismatches,
+    without loading the whole file."""
+    header = pd.read_csv(path, nrows=0, sep=sep)
+    miss = [c for c in needed if c not in header.columns]
+    if miss:
+        raise ValueError(
+            f"{label} file '{os.path.basename(path)}' is missing required "
+            f"columns: {miss}. Found columns: {list(header.columns)[:30]}"
+            + (" ..." if len(header.columns) > 30 else "")
+        )
+    logger.info("%s schema OK (%d required columns present, %d total in file).",
+                label, len(needed), len(header.columns))
 
 
 def enforce_cutoff(comm: pd.DataFrame, purch: pd.DataFrame):
@@ -214,7 +272,8 @@ def run_pipeline(args) -> dict:
 
     # ---------------- 1) load + cutoff ----------------
     with log_stage("1/8 load data + enforce cutoff"):
-        comm, purch = load_or_generate(args.comm, args.purch)
+        comm, purch = load_or_generate(args.comm, args.purch,
+                                       sep=args.sep, chunksize=args.chunksize)
         comm, purch = enforce_cutoff(comm, purch)
 
         base_rate = comm["click_date"].notna().mean()
@@ -262,9 +321,20 @@ def run_pipeline(args) -> dict:
     ]
     cv_results = {}
     with log_stage("4/8 cross-validated model selection (5-fold)"):
+        # On very large training sets, model SELECTION is done on a random
+        # sample for speed/memory; the WINNER is later refit on the FULL train.
+        Xcv, tcv, ycv = X_train, t_train, y_train
+        if len(X_train) > args.max_cv_rows:
+            rng = np.random.default_rng(42)
+            sample_idx = rng.choice(len(X_train), size=args.max_cv_rows, replace=False)
+            Xcv = X_train.iloc[sample_idx]
+            tcv = t_train.iloc[sample_idx]
+            ycv = y_train.iloc[sample_idx]
+            logger.info("train has %d rows -> CV model selection on a %d-row sample "
+                        "(winner refit on full train).", len(X_train), args.max_cv_rows)
         for i, (name, base) in enumerate(candidates, 1):
             logger.info("CV candidate %d/%d: %s [%s] ...", i, len(candidates), name, base)
-            cv = cross_val_uplift(name, base, preprocessor, X_train, t_train, y_train)
+            cv = cross_val_uplift(name, base, preprocessor, Xcv, tcv, ycv)
             cv_results[f"{name}+{base}"] = cv
             lo, hi = cv["qini_ci95"]
             logger.info("  -> Qini=%.4f +/- %.4f (95%% CI [%.4f, %.4f]) uplift@30%%=%.4f",
@@ -381,6 +451,13 @@ def main():
                         help="console log verbosity (default INFO)")
     parser.add_argument("--log-file", default=None,
                         help="optional path to also write logs to a file")
+    parser.add_argument("--max-cv-rows", type=int, default=300_000,
+                        help="cap rows used for CV model selection on big data "
+                             "(winner is always refit on the full train set)")
+    parser.add_argument("--sep", default=",",
+                        help="CSV separator of the input files (default ',')")
+    parser.add_argument("--chunksize", type=int, default=1_000_000,
+                        help="rows per chunk while streaming large CSVs")
     args = parser.parse_args()
 
     setup_logging(args.log_level, args.log_file)

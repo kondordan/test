@@ -36,61 +36,91 @@ def _ensure_datetime(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 
+_HIST_COLS = [
+    "hist_n_purchases", "hist_total_spend", "hist_avg_spend", "hist_avg_pax",
+    "hist_avg_adult", "hist_days_since_last", "hist_days_since_first",
+    "hist_visited_offer_state",
+]
+
+
+def _empty_hist(index) -> pd.DataFrame:
+    out = pd.DataFrame(0.0, index=index, columns=_HIST_COLS)
+    out["hist_days_since_last"] = np.nan
+    out["hist_days_since_first"] = np.nan
+    return out
+
+
 def _purchase_history_features(comm: pd.DataFrame, purch: pd.DataFrame) -> pd.DataFrame:
-    """For every communication row, aggregate the client's purchases that were
-    booked strictly before ``mailing_date`` (as-of aggregation, no leakage)."""
-    purch = purch.sort_values("date_booking")
+    """For every communication row, aggregate the client's purchases booked
+    strictly before ``mailing_date`` (as-of aggregation, no leakage).
 
-    # Pre-index purchases per email as numpy arrays for fast as-of lookups.
-    per_email: dict[str, dict] = {}
-    for email, g in purch.groupby("email", sort=False):
-        booking = g["date_booking"].to_numpy()
-        per_email[email] = {
-            "booking": booking,
-            "claim_cum": np.concatenate([[0.0], np.cumsum(g["claim_sum_usd"].to_numpy())]),
-            "adult_cum": np.concatenate([[0.0], np.cumsum(g["adult"].to_numpy())]),
-            "pax_cum": np.concatenate([[0.0], np.cumsum(g["pax"].to_numpy())]),
-            # earliest booking date per destination -> for "visited offer state".
-            "state_first": g.groupby("state_name")["date_booking"].min().to_dict(),
-        }
+    Fully vectorised via ``merge_asof`` so it scales to millions of rows instead
+    of looping in Python.
+    """
+    if len(purch) == 0:
+        return _empty_hist(comm.index)
 
-    n = len(comm)
-    out = {
-        "hist_n_purchases": np.zeros(n),
-        "hist_total_spend": np.zeros(n),
-        "hist_avg_spend": np.zeros(n),
-        "hist_avg_pax": np.zeros(n),
-        "hist_avg_adult": np.zeros(n),
-        "hist_days_since_last": np.full(n, np.nan),
-        "hist_days_since_first": np.full(n, np.nan),
-        "hist_visited_offer_state": np.zeros(n),
-    }
+    p = purch[["email", "date_booking", "claim_sum_usd", "adult", "pax", "state_name"]].copy()
+    p["date_booking"] = pd.to_datetime(p["date_booking"], errors="coerce")
+    p = p.dropna(subset=["date_booking"])
+    # Categorical merge keys cause dtype-mismatch errors -> use plain strings.
+    p["email"] = p["email"].astype(str)
+    p["state_name"] = p["state_name"].astype(str)
+    p = p.sort_values("date_booking", kind="mergesort")
 
-    emails = comm["email"].to_numpy()
-    mdates = comm["mailing_date"].to_numpy()
-    ostates = comm["state_name"].to_numpy()
+    g = p.groupby("email", sort=False)
+    p["_cum_count"] = g.cumcount() + 1
+    p["_cum_spend"] = g["claim_sum_usd"].cumsum()
+    p["_cum_pax"] = g["pax"].cumsum()
+    p["_cum_adult"] = g["adult"].cumsum()
 
-    for i in range(n):
-        rec = per_email.get(emails[i])
-        if rec is None:
-            continue
-        md = mdates[i]
-        # number of purchases strictly before the mailing date
-        k = int(np.searchsorted(rec["booking"], md, side="left"))
-        if k == 0:
-            continue
-        out["hist_n_purchases"][i] = k
-        total = rec["claim_cum"][k]
-        out["hist_total_spend"][i] = total
-        out["hist_avg_spend"][i] = total / k
-        out["hist_avg_pax"][i] = rec["pax_cum"][k] / k
-        out["hist_avg_adult"][i] = rec["adult_cum"][k] / k
-        out["hist_days_since_last"][i] = (md - rec["booking"][k - 1]) / np.timedelta64(1, "D")
-        out["hist_days_since_first"][i] = (md - rec["booking"][0]) / np.timedelta64(1, "D")
-        first = rec["state_first"].get(ostates[i])
-        out["hist_visited_offer_state"][i] = 1.0 if (first is not None and first < md) else 0.0
+    left = pd.DataFrame({
+        "_row": np.arange(len(comm)),
+        "email": comm["email"].astype(str).to_numpy(),
+        "mailing_date": pd.to_datetime(comm["mailing_date"], errors="coerce").to_numpy(),
+        "offer_state": comm["state_name"].astype(str).to_numpy(),
+    }).sort_values("mailing_date", kind="mergesort")
 
-    return pd.DataFrame(out, index=comm.index)
+    right = p[["email", "date_booking", "_cum_count", "_cum_spend", "_cum_pax", "_cum_adult"]]
+    # backward + no exact match => only purchases STRICTLY before mailing_date.
+    merged = pd.merge_asof(
+        left, right,
+        left_on="mailing_date", right_on="date_booking",
+        by="email", direction="backward", allow_exact_matches=False,
+    )
+
+    # Earliest booking per client (valid prior history whenever count > 0).
+    first_book = g["date_booking"].min().rename("_first_booking")
+    merged = merged.merge(first_book, on="email", how="left")
+
+    # Earliest booking per (client, destination) -> "already visited offer state".
+    state_first = (p.groupby(["email", "state_name"], observed=True)["date_booking"]
+                   .min().rename("_state_first").reset_index())
+    merged = merged.merge(state_first, left_on=["email", "offer_state"],
+                          right_on=["email", "state_name"], how="left")
+
+    cnt = merged["_cum_count"]
+    has = cnt.notna()
+    cnt_safe = cnt.where(has)
+    md = merged["mailing_date"]
+
+    out = pd.DataFrame(index=merged.index)
+    out["hist_n_purchases"] = cnt.fillna(0.0)
+    out["hist_total_spend"] = merged["_cum_spend"].fillna(0.0)
+    out["hist_avg_spend"] = (merged["_cum_spend"] / cnt_safe).fillna(0.0)
+    out["hist_avg_pax"] = (merged["_cum_pax"] / cnt_safe).fillna(0.0)
+    out["hist_avg_adult"] = (merged["_cum_adult"] / cnt_safe).fillna(0.0)
+    out["hist_days_since_last"] = (md - merged["date_booking"]).dt.total_seconds() / 86400.0
+    dsf = (md - merged["_first_booking"]).dt.total_seconds() / 86400.0
+    out["hist_days_since_first"] = dsf.where(has)
+    out["hist_visited_offer_state"] = (
+        merged["_state_first"].notna() & (merged["_state_first"] < md)
+    ).astype(float)
+
+    out["_row"] = merged["_row"].to_numpy()
+    out = out.sort_values("_row").drop(columns="_row").reset_index(drop=True)
+    out.index = comm.index
+    return out[_HIST_COLS]
 
 
 def _past_mailing_features(comm: pd.DataFrame) -> pd.DataFrame:
@@ -153,12 +183,16 @@ def build_dataset(comm: pd.DataFrame, purch: pd.DataFrame):
     cat["mailing_name"] = comm["mailing_name"].astype(str)
     cat["offer_state_name"] = comm["state_name"].astype(str)
 
+    # Downcast numeric features to float32 to roughly halve memory on big data.
+    feat = feat.astype("float32")
+
     X = pd.concat([feat, cat], axis=1)
 
     numeric_cols = feat.columns.tolist()
     categorical_cols = cat.columns.tolist()
-    logger.info("features ready: target click_rate=%.4f, treated share=%.4f",
-                target.mean(), treatment.mean())
+    logger.info("features ready: %s | target click_rate=%.4f | treated share=%.4f | "
+                "~%.0f MB", X.shape, target.mean(), treatment.mean(),
+                X.memory_usage(deep=True).sum() / 1e6)
 
     meta = pd.DataFrame({
         "email": comm["email"].to_numpy(),

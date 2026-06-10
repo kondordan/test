@@ -155,16 +155,21 @@ def cross_val_uplift(model_name, base_kind, preprocessor, X, treatment, target,
     }
 
 
-def bootstrap_qini_ci(y_true, uplift, treatment, n_boot: int = 500, seed: int = 42):
-    """Bootstrap 95% CI of the held-out Qini AUC."""
+def bootstrap_qini_ci(y_true, uplift, treatment, n_boot: int = 200,
+                      seed: int = 42, max_sample: int = 100_000):
+    """Bootstrap 95% CI of the held-out Qini AUC.
+
+    Each iteration resamples at most ``max_sample`` rows so the cost stays bounded
+    on large holdouts (Qini is O(n log n) per iteration)."""
     rng = np.random.default_rng(seed)
     y_true = np.asarray(y_true)
     uplift = np.asarray(uplift)
     treatment = np.asarray(treatment)
     n = len(y_true)
+    draw = min(n, max_sample)
     scores = []
     for _ in range(n_boot):
-        idx = rng.integers(0, n, n)
+        idx = rng.integers(0, n, draw)
         # need both treatment arms present in the resample
         if treatment[idx].min() == treatment[idx].max():
             continue
@@ -173,6 +178,8 @@ def bootstrap_qini_ci(y_true, uplift, treatment, n_boot: int = 500, seed: int = 
         except Exception:
             continue
     scores = np.array(scores)
+    if scores.size == 0:
+        return float("nan"), float("nan"), float("nan")
     return float(np.percentile(scores, 2.5)), float(np.percentile(scores, 97.5)), float(scores.mean())
 
 
