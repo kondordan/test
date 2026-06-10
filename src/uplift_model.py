@@ -34,7 +34,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
 from sklift.metrics import qini_auc_score, uplift_at_k, uplift_auc_score
 
@@ -42,15 +42,35 @@ logger = logging.getLogger(__name__)
 
 RANDOM_STATE = 42
 
+# Cap one-hot width per categorical column. High-cardinality fields (e.g. a real
+# `mailing_name` with thousands of campaign codes) would otherwise blow up the
+# DENSE design matrix to tens of GB and OOM-kill the process. Keeping the most
+# frequent categories and grouping the long, rare tail into a single
+# "infrequent" bucket bounds memory AND curbs overfitting on rare values, so it
+# does not reduce predictive quality. Override via the env var if ever needed.
+MAX_OHE_CATEGORIES = int(os.environ.get("UPLIFT_MAX_OHE_CATEGORIES", "50"))
+
+
+def _to_float32(a):
+    """Module-level (picklable) caster so the fitted preprocessor can be saved
+    with joblib. Keeps the design matrix float32 to halve memory."""
+    return np.asarray(a, dtype=np.float32)
+
 
 def build_preprocessor(numeric_cols: list[str], categorical_cols: list[str]) -> ColumnTransformer:
     numeric = Pipeline([
         ("impute", SimpleImputer(strategy="median")),
         ("scale", StandardScaler()),
+        ("cast", FunctionTransformer(_to_float32, feature_names_out="one-to-one")),
     ])
+    # max_categories bounds the encoded width; "infrequent_if_exist" also maps
+    # unseen categories (at holdout/scoring time) to the infrequent bucket
+    # instead of erroring.
     categorical = Pipeline([
         ("impute", SimpleImputer(strategy="most_frequent")),
-        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ("ohe", OneHotEncoder(handle_unknown="infrequent_if_exist",
+                              max_categories=MAX_OHE_CATEGORIES,
+                              sparse_output=False, dtype=np.float32)),
     ])
     return ColumnTransformer([
         ("num", numeric, numeric_cols),
