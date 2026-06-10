@@ -96,10 +96,17 @@ def _past_mailing_features(comm: pd.DataFrame) -> pd.DataFrame:
     df["_clicked"] = df["click_date"].notna().astype(float)
 
     grp = df.groupby("email", sort=False)
-    # expanding count / mean of prior rows -> shift(1) to exclude current row
-    df["past_n_mailings"] = grp.cumcount()
-    df["past_open_rate"] = grp["_opened"].apply(lambda s: s.shift(1).expanding().mean()).to_numpy()
-    df["past_click_rate"] = grp["_clicked"].apply(lambda s: s.shift(1).expanding().mean()).to_numpy()
+    # Number of PRIOR mailings for this client (current row excluded).
+    past_n = grp.cumcount()
+    # Sum over prior rows = cumulative sum including current minus current value.
+    prior_opened = grp["_opened"].cumsum() - df["_opened"]
+    prior_clicked = grp["_clicked"].cumsum() - df["_clicked"]
+    # Expanding mean of prior rows (NaN when there is no history yet).
+    # This vectorised form is robust across pandas versions (no groupby.apply).
+    denom = past_n.replace(0, np.nan)
+    df["past_n_mailings"] = past_n
+    df["past_open_rate"] = prior_opened / denom
+    df["past_click_rate"] = prior_clicked / denom
 
     df = df.drop(columns=["_opened", "_clicked"])
     return df[["past_n_mailings", "past_open_rate", "past_click_rate"]].reindex(comm.index)
