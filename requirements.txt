@@ -1,0 +1,15 @@
+# Lower bounds only: pip automatically picks the newest version that your
+# Python interpreter supports (respects each package's Requires-Python).
+#
+# Verified to resolve on Python 3.8 -> 3.12, e.g. on Python 3.8 pip installs
+# numpy 1.24.4, pandas 2.0.3, scikit-learn 1.3.2, matplotlib 3.7.x.
+# Recommended interpreter: Python 3.9+ (ideally 3.10/3.11).
+#
+# Note: scikit-learn>=1.2 is required because the code uses
+# OneHotEncoder(sparse_output=...), introduced in scikit-learn 1.2.
+numpy>=1.21
+pandas>=1.3
+scikit-learn>=1.2
+scikit-uplift>=0.5.0
+matplotlib>=3.4
+joblib>=1.1
