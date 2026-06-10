@@ -131,20 +131,62 @@ def _dtype_map(num_cols, cat_cols):
     return dmap
 
 
+def _estimate_total_rows(path, sep=",") -> int:
+    """Cheaply estimate the row count from file size and the average length of
+    the first ~2000 data lines (reads only a few KB)."""
+    size = os.path.getsize(path)
+    lengths = []
+    with open(path, "rb") as f:
+        f.readline()  # header
+        for _ in range(2000):
+            line = f.readline()
+            if not line:
+                break
+            lengths.append(len(line))
+    if not lengths:
+        return 0
+    avg = sum(lengths) / len(lengths)
+    return max(1, int(size / avg))
+
+
 def read_csv_optimized(path, needed, date_cols, num_cols, cat_cols,
-                       chunksize=1_000_000, sep=","):
-    """Memory-friendly CSV reader.
+                       chunksize=1_000_000, sep=",",
+                       sample_rows=0, sample_frac=None,
+                       email_filter=None, seed=42):
+    """Memory-friendly CSV reader for very large files.
 
     - reads ONLY the needed columns (``usecols``) -> skips enriched extras;
-    - applies compact dtypes (float32 / category) to cut memory;
-    - parses just the required date columns;
-    - streams in chunks so peak memory stays bounded, logging progress.
-    """
-    logger.info("reading %s (only %d needed columns, chunksize=%d) ...",
-                os.path.basename(path), len(needed), chunksize)
-    dmap = _dtype_map(num_cols, cat_cols)  # dates parsed separately, not here
+    - compact dtypes (float32 / category) to cut memory;
+    - streams in chunks; **samples rows on the fly** so only the kept subset is
+      ever held in memory (essential for 100M+ row files);
+    - optional ``email_filter`` keeps only rows for a given set of clients;
+    - parses dates only on the (smaller) kept rows.
 
-    parts, total = [], 0
+    Sampling fraction is taken from ``sample_frac`` if given, else derived from
+    ``sample_rows`` (target row count) via an estimated total. ``sample_rows<=0``
+    and ``sample_frac=None`` => read everything.
+    """
+    rng = np.random.default_rng(seed)
+    frac = None
+    if sample_frac is not None:
+        frac = float(sample_frac)
+    elif sample_rows and sample_rows > 0:
+        total_est = _estimate_total_rows(path, sep)
+        frac = min(1.0, sample_rows / total_est) if total_est else 1.0
+        logger.info("estimated ~%d rows in %s -> sampling fraction %.5f "
+                    "(target ~%d rows)", total_est, os.path.basename(path),
+                    frac, sample_rows)
+    if frac is not None and frac >= 1.0:
+        frac = None  # no point sampling
+
+    logger.info("reading %s (only %d needed columns, chunksize=%d, sampling=%s) ...",
+                os.path.basename(path), len(needed), chunksize,
+                f"{frac:.5f}" if frac else "off")
+    dmap = _dtype_map(num_cols, cat_cols)
+    if email_filter is not None:
+        email_filter = np.asarray(list(email_filter))
+
+    parts, total_read, kept = [], 0, 0
     reader = pd.read_csv(
         path, sep=sep,
         usecols=lambda c: c in set(needed),
@@ -153,40 +195,60 @@ def read_csv_optimized(path, needed, date_cols, num_cols, cat_cols,
         low_memory=False,
     )
     for i, ch in enumerate(reader, 1):
-        for dc in date_cols:
-            if dc in ch.columns:
-                ch[dc] = pd.to_datetime(ch[dc], errors="coerce")
-        parts.append(ch)
-        total += len(ch)
-        logger.info("  chunk %d: +%d rows (total=%d)", i, len(ch), total)
+        total_read += len(ch)
+        if email_filter is not None:
+            ch = ch[ch["email"].isin(email_filter)]
+        if frac is not None and len(ch):
+            ch = ch[rng.random(len(ch)) < frac]
+        if len(ch):
+            ch = ch.copy()
+            for dc in date_cols:
+                if dc in ch.columns:
+                    ch[dc] = pd.to_datetime(ch[dc], errors="coerce")
+            parts.append(ch)
+            kept += len(ch)
+        if i % 20 == 0:
+            logger.info("  ... read %d rows, kept %d", total_read, kept)
 
     if not parts:
-        raise ValueError(f"{path} produced no rows.")
+        raise ValueError(f"{path}: no rows left after filtering/sampling "
+                         f"(read {total_read} rows).")
     df = parts[0] if len(parts) == 1 else pd.concat(parts, ignore_index=True)
+    del parts
     mem_mb = df.memory_usage(deep=True).sum() / 1e6
-    logger.info("read done: %s, ~%.0f MB in memory", df.shape, mem_mb)
+    logger.info("read done: %s (from %d source rows), ~%.0f MB in memory",
+                df.shape, total_read, mem_mb)
     return df
 
 
 def load_or_generate(comm_path: str | None, purch_path: str | None,
-                     sep: str = ",", chunksize: int = 1_000_000):
+                     sep: str = ",", chunksize: int = 1_000_000,
+                     sample_rows: int = 0, sample_frac: float | None = None):
+    def _read_pair(comm_p, purch_p, label):
+        logger.info("%s: comm=%s, purch=%s", label, comm_p, purch_p)
+        _check_columns_exist(comm_p, COMM_NEEDED, "communications", sep)
+        _check_columns_exist(purch_p, PURCH_NEEDED, "purchases", sep)
+        # 1) read (and sample) the communications table
+        comm = read_csv_optimized(comm_p, COMM_NEEDED, COMM_DATE_COLS,
+                                  COMM_NUM_COLS, COMM_CAT_COLS, chunksize, sep,
+                                  sample_rows=sample_rows, sample_frac=sample_frac)
+        # 2) read purchases ONLY for the sampled clients (full history, bounded
+        #    memory) -- purchase aggregates must stay complete per client.
+        emails = set(comm["email"].unique())
+        logger.info("filtering purchases to %d sampled clients ...", len(emails))
+        purch = read_csv_optimized(purch_p, PURCH_NEEDED, PURCH_DATE_COLS,
+                                   PURCH_NUM_COLS, PURCH_CAT_COLS, chunksize, sep,
+                                   email_filter=emails)
+        return comm, purch
+
     if comm_path and purch_path and os.path.exists(comm_path) and os.path.exists(purch_path):
-        logger.info("Loading real data: comm=%s, purch=%s", comm_path, purch_path)
-        _check_columns_exist(comm_path, COMM_NEEDED, "communications", sep)
-        _check_columns_exist(purch_path, PURCH_NEEDED, "purchases", sep)
-        comm = read_csv_optimized(comm_path, COMM_NEEDED, COMM_DATE_COLS,
-                                  COMM_NUM_COLS, COMM_CAT_COLS, chunksize, sep)
-        purch = read_csv_optimized(purch_path, PURCH_NEEDED, PURCH_DATE_COLS,
-                                   PURCH_NUM_COLS, PURCH_CAT_COLS, chunksize, sep)
+        comm, purch = _read_pair(comm_path, purch_path, "Loading real data")
     else:
         default_comm = os.path.join(DATA_DIR, "communications.csv")
         default_purch = os.path.join(DATA_DIR, "purchases.csv")
         if os.path.exists(default_comm) and os.path.exists(default_purch):
-            logger.info("Loading cached synthetic data from ./%s", DATA_DIR)
-            comm = read_csv_optimized(default_comm, COMM_NEEDED, COMM_DATE_COLS,
-                                      COMM_NUM_COLS, COMM_CAT_COLS, chunksize, sep)
-            purch = read_csv_optimized(default_purch, PURCH_NEEDED, PURCH_DATE_COLS,
-                                       PURCH_NUM_COLS, PURCH_CAT_COLS, chunksize, sep)
+            comm, purch = _read_pair(default_comm, default_purch,
+                                     "Loading cached synthetic data")
         else:
             logger.warning("No data files found -> generating synthetic dataset "
                            "(same schema). Pass --comm/--purch to use real data.")
@@ -214,10 +276,13 @@ def _check_columns_exist(path, needed, label, sep=","):
 
 
 def enforce_cutoff(comm: pd.DataFrame, purch: pd.DataFrame):
-    comm = comm.copy()
-    purch = purch.copy()
-    comm["mailing_date"] = pd.to_datetime(comm["mailing_date"], errors="coerce")
-    purch["date_booking"] = pd.to_datetime(purch["date_booking"], errors="coerce")
+    # Avoid full-frame .copy() here to keep peak memory low on big data; the
+    # boolean filtering below already returns new frames. Dates were parsed at
+    # read time, but re-coerce defensively (cheap on already-datetime columns).
+    if not pd.api.types.is_datetime64_any_dtype(comm["mailing_date"]):
+        comm["mailing_date"] = pd.to_datetime(comm["mailing_date"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(purch["date_booking"]):
+        purch["date_booking"] = pd.to_datetime(purch["date_booking"], errors="coerce")
 
     n_bad = int(comm["mailing_date"].isna().sum())
     if n_bad:
@@ -273,7 +338,9 @@ def run_pipeline(args) -> dict:
     # ---------------- 1) load + cutoff ----------------
     with log_stage("1/8 load data + enforce cutoff"):
         comm, purch = load_or_generate(args.comm, args.purch,
-                                       sep=args.sep, chunksize=args.chunksize)
+                                       sep=args.sep, chunksize=args.chunksize,
+                                       sample_rows=args.sample_rows,
+                                       sample_frac=args.sample_frac)
         comm, purch = enforce_cutoff(comm, purch)
 
         base_rate = comm["click_date"].notna().mean()
@@ -438,8 +505,19 @@ def run_pipeline(args) -> dict:
         logger.info("saved metrics report -> %s/metrics_report.json", OUT_DIR)
         logger.info("FINAL REPORT:\n%s", json.dumps(report, indent=2, ensure_ascii=False))
 
-    logger.info("PIPELINE FINISHED OK in %.2fs", time.perf_counter() - pipeline_t0)
+    logger.info("PIPELINE FINISHED OK in %.2fs%s",
+                time.perf_counter() - pipeline_t0, _peak_mem_str())
     return report
+
+
+def _peak_mem_str() -> str:
+    """Best-effort peak-RSS reporter (Unix) for the final log line."""
+    try:
+        import resource
+        peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return f" | peak memory ~{peak_kb / 1024:.0f} MB"
+    except Exception:
+        return ""
 
 
 def main():
@@ -458,6 +536,12 @@ def main():
                         help="CSV separator of the input files (default ',')")
     parser.add_argument("--chunksize", type=int, default=1_000_000,
                         help="rows per chunk while streaming large CSVs")
+    parser.add_argument("--sample-rows", type=int, default=3_000_000,
+                        help="target number of mailing rows to keep (uniform "
+                             "sample-on-read for huge files). 0 = use all rows.")
+    parser.add_argument("--sample-frac", type=float, default=None,
+                        help="explicit sampling fraction for the communications "
+                             "file (overrides --sample-rows)")
     args = parser.parse_args()
 
     setup_logging(args.log_level, args.log_file)
