@@ -21,8 +21,10 @@ Anti-overfitting practices applied here:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
@@ -181,6 +183,70 @@ def bootstrap_qini_ci(y_true, uplift, treatment, n_boot: int = 200,
     if scores.size == 0:
         return float("nan"), float("nan"), float("nan")
     return float(np.percentile(scores, 2.5)), float(np.percentile(scores, 97.5)), float(scores.mean())
+
+
+def train_ensemble(model_name, base_kind, preprocessor_cols, X_train, t_train,
+                   y_train, n_models: int = 3, frac: float = 0.8, seed: int = 42):
+    """Train ``n_models`` of the chosen meta-learner, each on a DIFFERENT random
+    subsample of the training data (with its own fitted preprocessor).
+
+    Because the pipeline samples large files, individual draws vary; training an
+    ensemble over several subsamples and averaging their uplift reduces this
+    sampling variance and curbs overfitting (bagging-style).
+    """
+    rng = np.random.default_rng(seed)
+    X_train = X_train.reset_index(drop=True)
+    t_train = t_train.reset_index(drop=True)
+    y_train = y_train.reset_index(drop=True)
+    n = len(X_train)
+    size = max(1, int(frac * n))
+
+    members = []
+    for m in range(n_models):
+        idx = rng.choice(n, size=size, replace=False)
+        pre = build_preprocessor(*preprocessor_cols)
+        Xm = pre.fit_transform(X_train.iloc[idx])
+        model = make_uplift_model(model_name, base_kind)
+        model.fit(Xm, y_train.iloc[idx].to_numpy(), t_train.iloc[idx].to_numpy())
+        members.append({"preprocessor": pre, "model": model})
+        logger.info("  ensemble model %d/%d trained on %d rows (seed-draw %d)",
+                    m + 1, n_models, size, m)
+    return members
+
+
+def predict_ensemble(members, X) -> np.ndarray:
+    """Average uplift prediction across ensemble members (each applies its own
+    fitted preprocessor)."""
+    preds = []
+    for mem in members:
+        Xt = mem["preprocessor"].transform(X)
+        preds.append(mem["model"].predict(Xt))
+    return np.mean(preds, axis=0)
+
+
+def save_ensemble(path, members, model_name, base_kind, numeric_cols,
+                  categorical_cols, extra: dict | None = None) -> None:
+    """Persist the trained ensemble (+ metadata) so it can be reloaded and run
+    independently of training (see predict.py)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "members": members,
+        "model_name": model_name,
+        "base_kind": base_kind,
+        "numeric_cols": numeric_cols,
+        "categorical_cols": categorical_cols,
+        "extra": extra or {},
+    }
+    joblib.dump(payload, path, compress=3)
+    logger.info("saved ensemble (%d models) -> %s", len(members), path)
+
+
+def load_ensemble(path):
+    payload = joblib.load(path)
+    logger.info("loaded ensemble: %d models (%s+%s) from %s",
+                len(payload["members"]), payload["model_name"],
+                payload["base_kind"], path)
+    return payload
 
 
 def response_auc(preprocessor, X_train, y_train, X_test, y_test) -> float:

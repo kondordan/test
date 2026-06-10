@@ -48,11 +48,12 @@ from data_generation import DISCOUNT_COL, generate  # noqa: E402
 from features import build_dataset  # noqa: E402
 from uplift_model import (  # noqa: E402
     bootstrap_qini_ci,
-    build_preprocessor,
     cross_val_uplift,
     evaluate_uplift,
-    make_uplift_model,
+    predict_ensemble,
     response_auc,
+    save_ensemble,
+    train_ensemble,
 )
 from sklift.metrics import (  # noqa: E402
     perfect_qini_curve,
@@ -60,10 +61,11 @@ from sklift.metrics import (  # noqa: E402
     uplift_by_percentile,
 )
 
-CUTOFF = pd.Timestamp("2026-08-01")
-TEST_SPLIT_DATE = pd.Timestamp("2026-04-01")  # last ~4 months -> time-based holdout
+CUTOFF = pd.Timestamp("2026-06-01")  # train on mailings/purchases STRICTLY before this
+TEST_SPLIT_DATE = pd.Timestamp("2026-04-01")  # last ~2 months -> time-based holdout
 DATA_DIR = "data"
 OUT_DIR = "outputs"
+MODEL_DIR = "models"
 
 logger = logging.getLogger("uplift")
 
@@ -116,7 +118,10 @@ COMM_NUM_COLS = [DISCOUNT_COL, "claim_sum_usd", "adult", "pax"]
 COMM_CAT_COLS = ["mailing_name", "state_name"]
 COMM_NEEDED = ["email"] + COMM_DATE_COLS + COMM_NUM_COLS + COMM_CAT_COLS
 
-PURCH_DATE_COLS = ["date_booking"]
+# date_begin is the trip START date. It is NOT used as a model feature, but is
+# needed to exclude clients who booked before the cutoff yet have not travelled
+# yet (trip starts on/after the cutoff) from the send-recommendation list.
+PURCH_DATE_COLS = ["date_booking", "date_begin"]
 PURCH_NUM_COLS = ["claim_sum_usd", "adult", "pax"]
 PURCH_CAT_COLS = ["state_name"]
 PURCH_NEEDED = ["email"] + PURCH_DATE_COLS + PURCH_NUM_COLS + PURCH_CAT_COLS
@@ -387,7 +392,7 @@ def run_pipeline(args) -> dict:
         ("SoloModel", "logreg"),
     ]
     cv_results = {}
-    with log_stage("4/8 cross-validated model selection (5-fold)"):
+    with log_stage("4/10 cross-validated model selection (5-fold)"):
         # On very large training sets, model SELECTION is done on a random
         # sample for speed/memory; the WINNER is later refit on the FULL train.
         Xcv, tcv, ycv = X_train, t_train, y_train
@@ -411,17 +416,13 @@ def run_pipeline(args) -> dict:
         logger.info("best model by CV Qini: %s (%.4f)",
                     best_key, cv_results[best_key]["qini_mean"])
 
-    # ---------------- 5) final fit + holdout evaluation ----------------
-    with log_stage(f"5/8 fit {best_key} on train, evaluate on holdout"):
-        pre = build_preprocessor(*preprocessor)
-        Xtr = pre.fit_transform(X_train)
-        Xte = pre.transform(X_test)
-        logger.info("transformed matrices: train=%s test=%s", Xtr.shape, Xte.shape)
-
-        model = make_uplift_model(best_name, best_base)
-        model.fit(Xtr, y_train.to_numpy(), t_train.to_numpy())
-        uplift_test = model.predict(Xte)
-        logger.info("predicted uplift on holdout: mean=%.4f std=%.4f min=%.4f max=%.4f",
+    # ---------------- 5) train 3-model ensemble + holdout evaluation ----------------
+    with log_stage(f"5/10 train {args.n_models}-model ensemble ({best_key}) + holdout eval"):
+        members = train_ensemble(best_name, best_base, preprocessor,
+                                 X_train, t_train, y_train,
+                                 n_models=args.n_models)
+        uplift_test = predict_ensemble(members, X_test)
+        logger.info("ensemble uplift on holdout: mean=%.4f std=%.4f min=%.4f max=%.4f",
                     float(np.mean(uplift_test)), float(np.std(uplift_test)),
                     float(np.min(uplift_test)), float(np.max(uplift_test)))
 
@@ -435,8 +436,17 @@ def run_pipeline(args) -> dict:
         logger.info("HOLDOUT AUUC=%.4f | uplift@30%%=%.4f | response ROC-AUC=%.4f",
                     holdout.auuc, holdout.uplift_at_30, resp_auc)
 
-    # ---------------- 6) plots ----------------
-    with log_stage("6/8 save plots"):
+    # ---------------- 6) persist the ensemble to disk ----------------
+    with log_stage("6/10 save trained ensemble to disk"):
+        model_path = os.path.join(MODEL_DIR, "uplift_ensemble.joblib")
+        save_ensemble(model_path, members, best_name, best_base,
+                      num_cols, cat_cols,
+                      extra={"cutoff": str(CUTOFF.date()),
+                             "test_split_date": str(TEST_SPLIT_DATE.date()),
+                             "holdout_qini": round(holdout.qini, 4)})
+
+    # ---------------- 7) plots ----------------
+    with log_stage("7/10 save plots"):
         try:
             _plot_qini(y_test.to_numpy(), uplift_test, t_test.to_numpy(),
                        os.path.join(OUT_DIR, "qini_curve.png"))
@@ -447,8 +457,8 @@ def run_pipeline(args) -> dict:
         except Exception:  # plotting must never break the pipeline
             logger.exception("plotting failed (continuing without plots)")
 
-    # ---------------- 7) per-client scores + decile lift table ----------------
-    with log_stage("7/8 per-client scores + decile lift table"):
+    # ---------------- 8) per-client scores + decile lift table ----------------
+    with log_stage("8/10 per-client scores + decile lift table"):
         scores = meta_test.copy()
         scores["predicted_uplift"] = uplift_test
         scores["clicked"] = y_test.to_numpy()
@@ -484,8 +494,20 @@ def run_pipeline(args) -> dict:
         logger.info("decile lift table (observed click uplift by predicted-uplift decile):\n%s",
                     lift_table.to_string(index=False))
 
-    # ---------------- 8) report ----------------
-    with log_stage("8/8 write metrics report"):
+    # ---------------- 9) send recommendations for every email ----------------
+    with log_stage("9/10 build send-recommendations per email"):
+        reco = build_send_recommendations(members, X, meta, comm, purch)
+        reco_path = os.path.join(OUT_DIR, "send_recommendations.csv")
+        reco.to_csv(reco_path, index=False)
+        n_send = int(reco["recommend_send"].sum())
+        n_excl = int(reco["has_upcoming_trip"].sum())
+        logger.info("recommendations for %d emails -> %s", len(reco), reco_path)
+        logger.info("  recommend SEND uplift mailing: %d (%.1f%%)",
+                    n_send, 100 * n_send / max(1, len(reco)))
+        logger.info("  excluded (bought but not yet travelled by cutoff): %d", n_excl)
+
+    # ---------------- 10) report ----------------
+    with log_stage("10/10 write metrics report"):
         report = {
             "cutoff": str(CUTOFF.date()),
             "n_mailings": int(len(comm)),
@@ -494,11 +516,15 @@ def run_pipeline(args) -> dict:
             "click_rate_no_discount": round(float(control_rate), 4),
             "naive_ate": round(float(treated_rate - control_rate), 4),
             "best_model": best_key,
+            "n_ensemble_models": args.n_models,
             "cv_qini_mean": round(cv_results[best_key]["qini_mean"], 4),
             "cv_qini_ci95": [round(v, 4) for v in cv_results[best_key]["qini_ci95"]],
             "holdout": {k: round(v, 4) for k, v in holdout.as_dict().items()},
             "holdout_qini_bootstrap_ci95": [round(boot_lo, 4), round(boot_hi, 4)],
             "response_roc_auc": round(resp_auc, 4),
+            "n_emails_scored": int(len(reco)),
+            "n_recommended_send": int(reco["recommend_send"].sum()),
+            "n_excluded_upcoming_trip": int(reco["has_upcoming_trip"].sum()),
         }
         with open(os.path.join(OUT_DIR, "metrics_report.json"), "w") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
@@ -508,6 +534,53 @@ def run_pipeline(args) -> dict:
     logger.info("PIPELINE FINISHED OK in %.2fs%s",
                 time.perf_counter() - pipeline_t0, _peak_mem_str())
     return report
+
+
+def emails_with_upcoming_trip(purch: pd.DataFrame, cutoff: pd.Timestamp) -> set:
+    """Clients who booked a tour before the cutoff but whose trip starts on/after
+    the cutoff (i.e. they have NOT travelled yet). They already have an upcoming
+    trip, so an uplift discount mailing is pointless -> exclude them.
+
+    All kept purchases already satisfy ``date_booking < cutoff`` (enforced
+    earlier); here we additionally require ``date_begin >= cutoff``.
+    """
+    if "date_begin" not in purch.columns:
+        logger.warning("purchases has no date_begin -> cannot detect upcoming "
+                       "trips; no clients excluded on that basis.")
+        return set()
+    db = pd.to_datetime(purch["date_begin"], errors="coerce")
+    upcoming = purch.loc[db >= cutoff, "email"].astype(str).unique()
+    return set(upcoming)
+
+
+def build_send_recommendations(members, X, meta, comm, purch) -> pd.DataFrame:
+    """For every e-mail in the dataset decide whether to send an uplift mailing.
+
+    - score every mailing row with the ensemble, average per e-mail to get the
+      client's discount-responsiveness (uplift);
+    - exclude clients who already bought a tour but have not travelled yet as of
+      the cutoff;
+    - recommend sending when uplift > 0 and the client is not excluded.
+    """
+    uplift_all = predict_ensemble(members, X)
+    df = pd.DataFrame({
+        "email": meta["email"].astype(str).to_numpy(),
+        "predicted_uplift": uplift_all,
+    })
+    per_email = (df.groupby("email")["predicted_uplift"].mean()
+                 .reset_index()
+                 .rename(columns={"predicted_uplift": "mean_predicted_uplift"}))
+
+    upcoming = emails_with_upcoming_trip(purch, CUTOFF)
+    per_email["has_upcoming_trip"] = per_email["email"].isin(upcoming)
+    per_email["recommend_send"] = (
+        (~per_email["has_upcoming_trip"]) & (per_email["mean_predicted_uplift"] > 0)
+    )
+    per_email = per_email.sort_values(
+        ["recommend_send", "mean_predicted_uplift"], ascending=[False, False]
+    ).reset_index(drop=True)
+    per_email["mean_predicted_uplift"] = per_email["mean_predicted_uplift"].round(5)
+    return per_email
 
 
 def _peak_mem_str() -> str:
@@ -542,6 +615,9 @@ def main():
     parser.add_argument("--sample-frac", type=float, default=None,
                         help="explicit sampling fraction for the communications "
                              "file (overrides --sample-rows)")
+    parser.add_argument("--n-models", type=int, default=3,
+                        help="number of models in the ensemble, each trained on "
+                             "a different sampled subset (default 3)")
     args = parser.parse_args()
 
     setup_logging(args.log_level, args.log_file)
