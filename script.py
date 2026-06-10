@@ -379,6 +379,11 @@ def run_pipeline(args) -> dict:
                     split_kind, len(X_train), int(t_train.sum()), y_train.mean(),
                     len(X_test), int(t_test.sum()),
                     y_test.mean() if len(X_test) else float("nan"))
+        if args.balance:
+            logger.info("balancing training set (keep all promo + %.2fx no-promo) ...",
+                        args.balance_ratio)
+            X_train, t_train, y_train = balance_training_set(
+                X_train, t_train, y_train, args.balance_ratio)
 
     # ---------------- 4) CV model selection ----------------
     candidates = [
@@ -513,6 +518,9 @@ def run_pipeline(args) -> dict:
             "naive_ate": round(float(treated_rate - control_rate), 4),
             "best_model": best_key,
             "holdout_split": split_kind,
+            "balanced_training": bool(args.balance),
+            "balance_ratio": args.balance_ratio if args.balance else None,
+            "n_train_rows": int(len(X_train)),
             "n_ensemble_models": args.n_models,
             "cv_qini_mean": round(cv_results[best_key]["qini_mean"], 4),
             "cv_qini_ci95": [round(v, 4) for v in cv_results[best_key]["qini_ci95"]],
@@ -590,6 +598,41 @@ def make_holdout_split(X, treatment, target, meta):
                        "Uplift metrics will be noisy; rely also on CV metrics.",
                        int(t_test.to_numpy().sum()))
     return X_train, X_test, t_train, t_test, y_train, y_test, meta_test, kind
+
+
+def balance_training_set(X_train, t_train, y_train, ratio: float, seed: int = 42):
+    """Undersample the control (no-promo) class of the TRAINING set.
+
+    Keeps ALL promo (discount) mailings and ``ratio`` x as many randomly chosen
+    no-promo mailings. Useful when promo is very rare (here ~0.8%): a balanced
+    training set lets the learners actually see the treatment signal. Applied to
+    TRAINING data only -- the holdout is left in its natural distribution so the
+    reported metrics stay honest.
+    """
+    t = t_train.to_numpy()
+    treated_pos = np.where(t == 1)[0]
+    control_pos = np.where(t == 0)[0]
+    n_treated = len(treated_pos)
+    if n_treated == 0:
+        logger.warning("balance: no promo rows in train -> skipping balancing.")
+        return X_train, t_train, y_train
+
+    n_keep = int(round(ratio * n_treated))
+    rng = np.random.default_rng(seed)
+    if n_keep >= len(control_pos):
+        logger.warning("balance: requested %d no-promo rows but only %d available "
+                       "-> keeping all no-promo (ratio effectively %.2f).",
+                       n_keep, len(control_pos), len(control_pos) / max(1, n_treated))
+        keep_control = control_pos
+    else:
+        keep_control = rng.choice(control_pos, size=n_keep, replace=False)
+
+    keep = np.sort(np.concatenate([treated_pos, keep_control]))
+    Xb, tb, yb = X_train.iloc[keep], t_train.iloc[keep], y_train.iloc[keep]
+    logger.info("balanced TRAIN: promo=%d, no-promo=%d (ratio 1:%.2f), total=%d "
+                "(was %d)", n_treated, len(keep_control),
+                len(keep_control) / max(1, n_treated), len(keep), len(X_train))
+    return Xb, tb, yb
 
 
 def emails_with_upcoming_trip(purch: pd.DataFrame, cutoff: pd.Timestamp) -> set:
@@ -674,6 +717,13 @@ def main():
     parser.add_argument("--n-models", type=int, default=3,
                         help="number of models in the ensemble, each trained on "
                              "a different sampled subset (default 3)")
+    parser.add_argument("--balance", action="store_true",
+                        help="balance the TRAINING set: keep all promo (discount) "
+                             "mailings + (balance-ratio x) as many non-promo ones. "
+                             "Off by default; holdout stays untouched.")
+    parser.add_argument("--balance-ratio", type=float, default=2.0,
+                        help="non-promo : promo ratio when --balance is on "
+                             "(default 2.0 = twice as many non-promo as promo)")
     args = parser.parse_args()
 
     setup_logging(args.log_level, args.log_file)
