@@ -370,19 +370,15 @@ def run_pipeline(args) -> dict:
         logger.info("feature matrix: %s (%d numeric + %d categorical)",
                     X.shape, len(num_cols), len(cat_cols))
 
-    # ---------------- 3) time-based split ----------------
-    with log_stage("3/8 time-based train/test split"):
-        is_test = meta["mailing_date"] >= TEST_SPLIT_DATE
-        X_train, X_test = X[~is_test], X[is_test]
-        t_train, t_test = treatment[~is_test], treatment[is_test]
-        y_train, y_test = target[~is_test], target[is_test]
-        meta_test = meta[is_test]
-        logger.info("split @ %s -> train=%d (clicks=%.3f), test=%d (clicks=%.3f)",
-                    TEST_SPLIT_DATE.date(), len(X_train), y_train.mean(),
-                    len(X_test), y_test.mean() if len(X_test) else float("nan"))
-        if len(X_test) == 0:
-            raise ValueError(f"Holdout is empty: no mailings on/after "
-                             f"{TEST_SPLIT_DATE.date()}. Adjust TEST_SPLIT_DATE.")
+    # ---------------- 3) train/test split (time-based, with fallback) ----------------
+    with log_stage("3/10 train/test split"):
+        (X_train, X_test, t_train, t_test, y_train, y_test, meta_test,
+         split_kind) = make_holdout_split(X, treatment, target, meta)
+        logger.info("split=%s -> train=%d (treated=%d, clicks=%.4f), "
+                    "test=%d (treated=%d, clicks=%.4f)",
+                    split_kind, len(X_train), int(t_train.sum()), y_train.mean(),
+                    len(X_test), int(t_test.sum()),
+                    y_test.mean() if len(X_test) else float("nan"))
 
     # ---------------- 4) CV model selection ----------------
     candidates = [
@@ -516,6 +512,7 @@ def run_pipeline(args) -> dict:
             "click_rate_no_discount": round(float(control_rate), 4),
             "naive_ate": round(float(treated_rate - control_rate), 4),
             "best_model": best_key,
+            "holdout_split": split_kind,
             "n_ensemble_models": args.n_models,
             "cv_qini_mean": round(cv_results[best_key]["qini_mean"], 4),
             "cv_qini_ci95": [round(v, 4) for v in cv_results[best_key]["qini_ci95"]],
@@ -534,6 +531,65 @@ def run_pipeline(args) -> dict:
     logger.info("PIPELINE FINISHED OK in %.2fs%s",
                 time.perf_counter() - pipeline_t0, _peak_mem_str())
     return report
+
+
+MIN_TEST_TREATED = 50  # need at least this many treated rows in the holdout to
+                       # evaluate uplift (both arms required by Qini/uplift metrics)
+
+
+def make_holdout_split(X, treatment, target, meta):
+    """Prefer a TIME-BASED (out-of-time) holdout. But discounts are rare and can
+    be clustered in time -- if the recent window contains no/too-few treated
+    mailings, uplift is not evaluable there. In that case fall back to a
+    TREATMENT-stratified random holdout so evaluation is possible, with a clear
+    warning. Feature engineering stays leakage-free either way.
+
+    Returns (X_train, X_test, t_train, t_test, y_train, y_test, meta_test, kind).
+    """
+    is_test = (meta["mailing_date"] >= TEST_SPLIT_DATE).to_numpy()
+    t = treatment.to_numpy()
+
+    time_ok = (
+        is_test.any() and (~is_test).any()
+        and int(t[is_test].sum()) >= MIN_TEST_TREATED
+        and int((t[is_test] == 0).sum()) > 0
+        and int(t[~is_test].sum()) > 0          # train must also have treated
+    )
+    if time_ok:
+        sel = is_test
+        kind = "time-based"
+    else:
+        n_recent_treated = int(t[is_test].sum()) if is_test.any() else 0
+        logger.warning(
+            "time-based holdout (>= %s) is not usable for uplift eval "
+            "(treated in window=%d < %d, or one arm missing). Discounts are rare/"
+            "time-clustered -> falling back to a treatment-stratified random "
+            "holdout. (Features remain leakage-free.)",
+            TEST_SPLIT_DATE.date(), n_recent_treated, MIN_TEST_TREATED)
+        from sklearn.model_selection import train_test_split
+        strat = (treatment.astype(str) + "_" + target.astype(str)).to_numpy()
+        idx = np.arange(len(X))
+        try:
+            _, test_idx = train_test_split(idx, test_size=0.2, random_state=42,
+                                           stratify=strat)
+        except ValueError:
+            # extremely rare class for stratification -> stratify on treatment only
+            _, test_idx = train_test_split(idx, test_size=0.2, random_state=42,
+                                           stratify=t)
+        sel = np.zeros(len(X), dtype=bool)
+        sel[test_idx] = True
+        kind = "stratified-random (time-based unusable)"
+
+    X_train, X_test = X[~sel], X[sel]
+    t_train, t_test = treatment[~sel], treatment[sel]
+    y_train, y_test = target[~sel], target[sel]
+    meta_test = meta[sel]
+
+    if int(t_test.to_numpy().sum()) < MIN_TEST_TREATED or int(t_train.to_numpy().sum()) == 0:
+        logger.warning("holdout still has few treated rows (test treated=%d). "
+                       "Uplift metrics will be noisy; rely also on CV metrics.",
+                       int(t_test.to_numpy().sum()))
+    return X_train, X_test, t_train, t_test, y_train, y_test, meta_test, kind
 
 
 def emails_with_upcoming_trip(purch: pd.DataFrame, cutoff: pd.Timestamp) -> set:

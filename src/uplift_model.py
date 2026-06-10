@@ -125,6 +125,15 @@ class EvalResult:
 
 
 def evaluate_uplift(y_true, uplift, treatment, k: float = 0.3) -> EvalResult:
+    treatment = np.asarray(treatment)
+    # Uplift metrics need BOTH arms present; otherwise sklift raises. Degrade
+    # gracefully to NaN instead of crashing the whole pipeline.
+    uniq = np.unique(treatment)
+    if not (0 in uniq and 1 in uniq):
+        logger.warning("evaluate_uplift: only one treatment arm present "
+                       "(values=%s) -> uplift metrics undefined (NaN).", uniq.tolist())
+        return EvalResult(qini=float("nan"), auuc=float("nan"),
+                          uplift_at_30=float("nan"))
     return EvalResult(
         qini=qini_auc_score(y_true, uplift, treatment),
         auuc=uplift_auc_score(y_true, uplift, treatment),
