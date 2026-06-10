@@ -29,8 +29,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
+import time
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -62,26 +65,94 @@ TEST_SPLIT_DATE = pd.Timestamp("2026-04-01")  # last ~4 months -> time-based hol
 DATA_DIR = "data"
 OUT_DIR = "outputs"
 
+logger = logging.getLogger("uplift")
+
+
+def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
+    """Configure root logging so every module (script + src/*) streams to console.
+
+    Format includes a timestamp, level and logger name so each stage and any
+    failure can be traced. Optionally also mirrors logs to ``log_file``.
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    logging.basicConfig(
+        level=getattr(logging, str(level).upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
+        force=True,  # override any handler the libraries may have installed
+    )
+    # Keep noisy third-party libraries from flooding the console at DEBUG.
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    # Route Python warnings through logging (so they are timestamped/formatted)
+    # and silence a harmless, repetitive deprecation emitted from inside sklift.
+    import warnings
+    logging.captureWarnings(True)
+    warnings.filterwarnings("ignore", message=".*stable_cumsum is deprecated.*")
+
+
+@contextmanager
+def log_stage(name: str):
+    """Log START/DONE (with elapsed seconds) around a pipeline stage and surface
+    any exception with a full traceback before re-raising it."""
+    logger.info("[START] %s", name)
+    t0 = time.perf_counter()
+    try:
+        yield
+    except Exception:
+        logger.exception("[FAILED] %s (after %.2fs)", name, time.perf_counter() - t0)
+        raise
+    else:
+        logger.info("[DONE]  %s (%.2fs)", name, time.perf_counter() - t0)
+
 
 def load_or_generate(comm_path: str | None, purch_path: str | None):
     if comm_path and purch_path and os.path.exists(comm_path) and os.path.exists(purch_path):
-        print(f"Loading real data: {comm_path}, {purch_path}")
+        logger.info("Loading real data: comm=%s, purch=%s", comm_path, purch_path)
         comm = pd.read_csv(comm_path)
         purch = pd.read_csv(purch_path)
     else:
         default_comm = os.path.join(DATA_DIR, "communications.csv")
         default_purch = os.path.join(DATA_DIR, "purchases.csv")
         if os.path.exists(default_comm) and os.path.exists(default_purch):
-            print("Loading cached synthetic data from ./data")
+            logger.info("Loading cached synthetic data from ./%s", DATA_DIR)
             comm = pd.read_csv(default_comm)
             purch = pd.read_csv(default_purch)
         else:
-            print("No data found -> generating synthetic dataset (same schema).")
+            logger.warning("No data files found -> generating synthetic dataset "
+                           "(same schema). Pass --comm/--purch to use real data.")
             os.makedirs(DATA_DIR, exist_ok=True)
             comm, purch = generate()
             comm.to_csv(default_comm, index=False)
             purch.to_csv(default_purch, index=False)
+    logger.info("Loaded communications=%s, purchases=%s", comm.shape, purch.shape)
+    _validate_schema(comm, purch)
     return comm, purch
+
+
+REQUIRED_COMM_COLS = [
+    "email", "mailing_name", "mailing_date", "open_date", "click_date",
+    "purchase_date", "trip_date", DISCOUNT_COL, "claim_sum_usd", "adult",
+    "pax", "state_name",
+]
+REQUIRED_PURCH_COLS = [
+    "email", "date_booking", "date_begin", "claim_sum_usd", "adult",
+    "pax", "state_name",
+]
+
+
+def _validate_schema(comm: pd.DataFrame, purch: pd.DataFrame) -> None:
+    """Fail early with a clear message if the input columns do not match the
+    expected schema (the most common real-data error)."""
+    miss_c = [c for c in REQUIRED_COMM_COLS if c not in comm.columns]
+    miss_p = [c for c in REQUIRED_PURCH_COLS if c not in purch.columns]
+    if miss_c:
+        raise ValueError(f"communications table is missing columns: {miss_c}")
+    if miss_p:
+        raise ValueError(f"purchases table is missing columns: {miss_p}")
+    logger.info("Schema validation passed (comm + purchases columns OK).")
 
 
 def enforce_cutoff(comm: pd.DataFrame, purch: pd.DataFrame):
@@ -90,10 +161,19 @@ def enforce_cutoff(comm: pd.DataFrame, purch: pd.DataFrame):
     comm["mailing_date"] = pd.to_datetime(comm["mailing_date"], errors="coerce")
     purch["date_booking"] = pd.to_datetime(purch["date_booking"], errors="coerce")
 
+    n_bad = int(comm["mailing_date"].isna().sum())
+    if n_bad:
+        logger.warning("%d rows have unpar. mailing_date and will be dropped by the "
+                       "cutoff filter.", n_bad)
+
     n0 = len(comm)
     comm = comm[comm["mailing_date"] < CUTOFF].reset_index(drop=True)
     purch = purch[purch["date_booking"] < CUTOFF].reset_index(drop=True)
-    print(f"Cutoff {CUTOFF.date()}: kept {len(comm)}/{n0} mailings, {len(purch)} purchases.")
+    logger.info("Cutoff %s: kept %d/%d mailings, %d purchases.",
+                CUTOFF.date(), len(comm), n0, len(purch))
+    if len(comm) == 0:
+        raise ValueError(f"No mailings left before cutoff {CUTOFF.date()}. "
+                         "Check mailing_date values / adjust CUTOFF.")
     return comm, purch
 
 
@@ -128,37 +208,50 @@ def _plot_uplift_by_percentile(y_true, uplift, treatment, path):
     plt.close(fig)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--comm", default=None, help="communications CSV path")
-    parser.add_argument("--purch", default=None, help="purchases CSV path")
-    args = parser.parse_args()
-
+def run_pipeline(args) -> dict:
     os.makedirs(OUT_DIR, exist_ok=True)
+    pipeline_t0 = time.perf_counter()
 
     # ---------------- 1) load + cutoff ----------------
-    comm, purch = load_or_generate(args.comm, args.purch)
-    comm, purch = enforce_cutoff(comm, purch)
+    with log_stage("1/8 load data + enforce cutoff"):
+        comm, purch = load_or_generate(args.comm, args.purch)
+        comm, purch = enforce_cutoff(comm, purch)
 
-    base_rate = comm["click_date"].notna().mean()
-    treated_rate = comm[comm[DISCOUNT_COL] > 0]["click_date"].notna().mean()
-    control_rate = comm[comm[DISCOUNT_COL] == 0]["click_date"].notna().mean()
-    print(f"\nclick_rate overall={base_rate:.4f} | with discount={treated_rate:.4f} "
-          f"| no discount={control_rate:.4f} | naive ATE={treated_rate - control_rate:.4f}")
+        base_rate = comm["click_date"].notna().mean()
+        treated_rate = comm[comm[DISCOUNT_COL] > 0]["click_date"].notna().mean()
+        control_rate = comm[comm[DISCOUNT_COL] == 0]["click_date"].notna().mean()
+        n_treated = int((comm[DISCOUNT_COL] > 0).sum())
+        n_control = int((comm[DISCOUNT_COL] == 0).sum())
+        logger.info("treatment balance: discount=%d (%.1f%%), no-discount=%d (%.1f%%)",
+                    n_treated, 100 * n_treated / len(comm),
+                    n_control, 100 * n_control / len(comm))
+        logger.info("click_rate overall=%.4f | discount=%.4f | no-discount=%.4f | "
+                    "naive ATE=%.4f", base_rate, treated_rate, control_rate,
+                    treated_rate - control_rate)
+        if n_treated == 0 or n_control == 0:
+            raise ValueError("Uplift needs BOTH groups: mailings with AND without "
+                             "a discount. One of the groups is empty.")
 
     # ---------------- 2) features ----------------
-    X, treatment, target, num_cols, cat_cols, meta = build_dataset(comm, purch)
-    preprocessor = (num_cols, cat_cols)
-    print(f"\nFeatures: {len(num_cols)} numeric + {len(cat_cols)} categorical "
-          f"-> {X.shape}")
+    with log_stage("2/8 build leakage-free features"):
+        X, treatment, target, num_cols, cat_cols, meta = build_dataset(comm, purch)
+        preprocessor = (num_cols, cat_cols)
+        logger.info("feature matrix: %s (%d numeric + %d categorical)",
+                    X.shape, len(num_cols), len(cat_cols))
 
     # ---------------- 3) time-based split ----------------
-    is_test = meta["mailing_date"] >= TEST_SPLIT_DATE
-    X_train, X_test = X[~is_test], X[is_test]
-    t_train, t_test = treatment[~is_test], treatment[is_test]
-    y_train, y_test = target[~is_test], target[is_test]
-    meta_test = meta[is_test]
-    print(f"Time split @ {TEST_SPLIT_DATE.date()}: train={len(X_train)} test={len(X_test)}")
+    with log_stage("3/8 time-based train/test split"):
+        is_test = meta["mailing_date"] >= TEST_SPLIT_DATE
+        X_train, X_test = X[~is_test], X[is_test]
+        t_train, t_test = treatment[~is_test], treatment[is_test]
+        y_train, y_test = target[~is_test], target[is_test]
+        meta_test = meta[is_test]
+        logger.info("split @ %s -> train=%d (clicks=%.3f), test=%d (clicks=%.3f)",
+                    TEST_SPLIT_DATE.date(), len(X_train), y_train.mean(),
+                    len(X_test), y_test.mean() if len(X_test) else float("nan"))
+        if len(X_test) == 0:
+            raise ValueError(f"Holdout is empty: no mailings on/after "
+                             f"{TEST_SPLIT_DATE.date()}. Adjust TEST_SPLIT_DATE.")
 
     # ---------------- 4) CV model selection ----------------
     candidates = [
@@ -167,108 +260,137 @@ def main():
         ("ClassTransformation", "hgb"),
         ("SoloModel", "logreg"),
     ]
-    print("\n=== Cross-validated model selection (5-fold, train period only) ===")
     cv_results = {}
-    for name, base in candidates:
-        cv = cross_val_uplift(name, base, preprocessor, X_train, t_train, y_train)
-        cv_results[f"{name}+{base}"] = cv
-        lo, hi = cv["qini_ci95"]
-        print(f"  {name:>20s} [{base:>6s}]  Qini={cv['qini_mean']:.4f} "
-              f"+/- {cv['qini_std']:.4f}  (95% CI [{lo:.4f}, {hi:.4f}])  "
-              f"uplift@30%={cv['uplift_at_30_mean']:.4f}")
+    with log_stage("4/8 cross-validated model selection (5-fold)"):
+        for i, (name, base) in enumerate(candidates, 1):
+            logger.info("CV candidate %d/%d: %s [%s] ...", i, len(candidates), name, base)
+            cv = cross_val_uplift(name, base, preprocessor, X_train, t_train, y_train)
+            cv_results[f"{name}+{base}"] = cv
+            lo, hi = cv["qini_ci95"]
+            logger.info("  -> Qini=%.4f +/- %.4f (95%% CI [%.4f, %.4f]) uplift@30%%=%.4f",
+                        cv["qini_mean"], cv["qini_std"], lo, hi, cv["uplift_at_30_mean"])
+        best_key = max(cv_results, key=lambda k: cv_results[k]["qini_mean"])
+        best_name, best_base = best_key.split("+")
+        logger.info("best model by CV Qini: %s (%.4f)",
+                    best_key, cv_results[best_key]["qini_mean"])
 
-    best_key = max(cv_results, key=lambda k: cv_results[k]["qini_mean"])
-    best_name, best_base = best_key.split("+")
-    print(f"\nBest model by CV Qini: {best_key}")
+    # ---------------- 5) final fit + holdout evaluation ----------------
+    with log_stage(f"5/8 fit {best_key} on train, evaluate on holdout"):
+        pre = build_preprocessor(*preprocessor)
+        Xtr = pre.fit_transform(X_train)
+        Xte = pre.transform(X_test)
+        logger.info("transformed matrices: train=%s test=%s", Xtr.shape, Xte.shape)
 
-    # ---------------- 5) final fit on train, eval on time holdout ----------------
-    pre = build_preprocessor(*preprocessor)
-    Xtr = pre.fit_transform(X_train)
-    Xte = pre.transform(X_test)
+        model = make_uplift_model(best_name, best_base)
+        model.fit(Xtr, y_train.to_numpy(), t_train.to_numpy())
+        uplift_test = model.predict(Xte)
+        logger.info("predicted uplift on holdout: mean=%.4f std=%.4f min=%.4f max=%.4f",
+                    float(np.mean(uplift_test)), float(np.std(uplift_test)),
+                    float(np.min(uplift_test)), float(np.max(uplift_test)))
 
-    model = make_uplift_model(best_name, best_base)
-    model.fit(Xtr, y_train.to_numpy(), t_train.to_numpy())
-    uplift_test = model.predict(Xte)
-
-    holdout = evaluate_uplift(y_test.to_numpy(), uplift_test, t_test.to_numpy())
-    boot_lo, boot_hi, boot_mean = bootstrap_qini_ci(
-        y_test.to_numpy(), uplift_test, t_test.to_numpy()
-    )
-    resp_auc = response_auc(preprocessor, X_train, y_train, X_test, y_test)
-
-    print("\n=== Forecast quality on TIME-BASED HOLDOUT ===")
-    print(f"  Qini AUC        : {holdout.qini:.4f}  "
-          f"(bootstrap 95% CI [{boot_lo:.4f}, {boot_hi:.4f}])")
-    print(f"  AUUC            : {holdout.auuc:.4f}")
-    print(f"  Uplift @ top 30%: {holdout.uplift_at_30:.4f}  "
-          f"(extra click_rate vs random targeting)")
-    print(f"  Response ROC-AUC: {resp_auc:.4f}  (secondary click-prediction diagnostic)")
+        holdout = evaluate_uplift(y_test.to_numpy(), uplift_test, t_test.to_numpy())
+        boot_lo, boot_hi, boot_mean = bootstrap_qini_ci(
+            y_test.to_numpy(), uplift_test, t_test.to_numpy()
+        )
+        resp_auc = response_auc(preprocessor, X_train, y_train, X_test, y_test)
+        logger.info("HOLDOUT Qini=%.4f (bootstrap 95%% CI [%.4f, %.4f])",
+                    holdout.qini, boot_lo, boot_hi)
+        logger.info("HOLDOUT AUUC=%.4f | uplift@30%%=%.4f | response ROC-AUC=%.4f",
+                    holdout.auuc, holdout.uplift_at_30, resp_auc)
 
     # ---------------- 6) plots ----------------
-    try:
-        _plot_qini(y_test.to_numpy(), uplift_test, t_test.to_numpy(),
-                   os.path.join(OUT_DIR, "qini_curve.png"))
-        _plot_uplift_by_percentile(y_test.to_numpy(), uplift_test, t_test.to_numpy(),
-                                   os.path.join(OUT_DIR, "uplift_by_percentile.png"))
-        print(f"\nSaved plots to {OUT_DIR}/qini_curve.png, {OUT_DIR}/uplift_by_percentile.png")
-    except Exception as e:  # plotting must never break the pipeline
-        print(f"[warn] plotting failed: {e}")
+    with log_stage("6/8 save plots"):
+        try:
+            _plot_qini(y_test.to_numpy(), uplift_test, t_test.to_numpy(),
+                       os.path.join(OUT_DIR, "qini_curve.png"))
+            _plot_uplift_by_percentile(y_test.to_numpy(), uplift_test, t_test.to_numpy(),
+                                       os.path.join(OUT_DIR, "uplift_by_percentile.png"))
+            logger.info("saved plots -> %s/qini_curve.png, %s/uplift_by_percentile.png",
+                        OUT_DIR, OUT_DIR)
+        except Exception:  # plotting must never break the pipeline
+            logger.exception("plotting failed (continuing without plots)")
 
-    # ---------------- 7) per-client scores + segments ----------------
-    scores = meta_test.copy()
-    scores["predicted_uplift"] = uplift_test
-    scores["clicked"] = y_test.to_numpy()
-    scores["had_discount"] = t_test.to_numpy()
-    # aggregate to client level: mean predicted discount-responsiveness
-    client_scores = (
-        scores.groupby("email")["predicted_uplift"].mean()
-        .sort_values(ascending=False)
-        .reset_index()
-        .rename(columns={"predicted_uplift": "discount_responsiveness"})
-    )
-    client_scores.to_csv(os.path.join(OUT_DIR, "client_uplift_scores.csv"), index=False)
+    # ---------------- 7) per-client scores + decile lift table ----------------
+    with log_stage("7/8 per-client scores + decile lift table"):
+        scores = meta_test.copy()
+        scores["predicted_uplift"] = uplift_test
+        scores["clicked"] = y_test.to_numpy()
+        scores["had_discount"] = t_test.to_numpy()
+        client_scores = (
+            scores.groupby("email")["predicted_uplift"].mean()
+            .sort_values(ascending=False)
+            .reset_index()
+            .rename(columns={"predicted_uplift": "discount_responsiveness"})
+        )
+        client_scores.to_csv(os.path.join(OUT_DIR, "client_uplift_scores.csv"), index=False)
+        logger.info("wrote %d per-client uplift scores -> %s/client_uplift_scores.csv",
+                    len(client_scores), OUT_DIR)
 
-    # Validate that high-score clients really react more (decile lift table).
-    scores["uplift_decile"] = pd.qcut(scores["predicted_uplift"].rank(method="first"),
-                                      10, labels=False)
-    rows = []
-    for d, g in scores.groupby("uplift_decile"):
-        tr = g[g["had_discount"] == 1]["clicked"].mean()
-        ct = g[g["had_discount"] == 0]["clicked"].mean()
-        rows.append({
-            "decile": int(d),
-            "n": len(g),
-            "click_rate_discount": round(float(tr), 4) if len(g[g["had_discount"] == 1]) else None,
-            "click_rate_no_discount": round(float(ct), 4) if len(g[g["had_discount"] == 0]) else None,
-            "observed_uplift": (round(float(tr - ct), 4)
-                                if len(g[g["had_discount"] == 1]) and len(g[g["had_discount"] == 0])
-                                else None),
-            "mean_pred_uplift": round(float(g["predicted_uplift"].mean()), 4),
-        })
-    lift_table = pd.DataFrame(rows)
-    lift_table.to_csv(os.path.join(OUT_DIR, "decile_lift_table.csv"), index=False)
-    print("\nDecile lift table (observed click uplift by predicted-uplift decile):")
-    print(lift_table.to_string(index=False))
+        scores["uplift_decile"] = pd.qcut(scores["predicted_uplift"].rank(method="first"),
+                                          10, labels=False)
+        rows = []
+        for d, g in scores.groupby("uplift_decile"):
+            tr = g[g["had_discount"] == 1]["clicked"].mean()
+            ct = g[g["had_discount"] == 0]["clicked"].mean()
+            rows.append({
+                "decile": int(d),
+                "n": len(g),
+                "click_rate_discount": round(float(tr), 4) if len(g[g["had_discount"] == 1]) else None,
+                "click_rate_no_discount": round(float(ct), 4) if len(g[g["had_discount"] == 0]) else None,
+                "observed_uplift": (round(float(tr - ct), 4)
+                                    if len(g[g["had_discount"] == 1]) and len(g[g["had_discount"] == 0])
+                                    else None),
+                "mean_pred_uplift": round(float(g["predicted_uplift"].mean()), 4),
+            })
+        lift_table = pd.DataFrame(rows)
+        lift_table.to_csv(os.path.join(OUT_DIR, "decile_lift_table.csv"), index=False)
+        logger.info("decile lift table (observed click uplift by predicted-uplift decile):\n%s",
+                    lift_table.to_string(index=False))
 
     # ---------------- 8) report ----------------
-    report = {
-        "cutoff": str(CUTOFF.date()),
-        "n_mailings": int(len(comm)),
-        "click_rate_overall": round(float(base_rate), 4),
-        "click_rate_with_discount": round(float(treated_rate), 4),
-        "click_rate_no_discount": round(float(control_rate), 4),
-        "naive_ate": round(float(treated_rate - control_rate), 4),
-        "best_model": best_key,
-        "cv_qini_mean": round(cv_results[best_key]["qini_mean"], 4),
-        "cv_qini_ci95": [round(v, 4) for v in cv_results[best_key]["qini_ci95"]],
-        "holdout": {k: round(v, 4) for k, v in holdout.as_dict().items()},
-        "holdout_qini_bootstrap_ci95": [round(boot_lo, 4), round(boot_hi, 4)],
-        "response_roc_auc": round(resp_auc, 4),
-    }
-    with open(os.path.join(OUT_DIR, "metrics_report.json"), "w") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-    print(f"\nSaved metrics report -> {OUT_DIR}/metrics_report.json")
-    print(json.dumps(report, indent=2, ensure_ascii=False))
+    with log_stage("8/8 write metrics report"):
+        report = {
+            "cutoff": str(CUTOFF.date()),
+            "n_mailings": int(len(comm)),
+            "click_rate_overall": round(float(base_rate), 4),
+            "click_rate_with_discount": round(float(treated_rate), 4),
+            "click_rate_no_discount": round(float(control_rate), 4),
+            "naive_ate": round(float(treated_rate - control_rate), 4),
+            "best_model": best_key,
+            "cv_qini_mean": round(cv_results[best_key]["qini_mean"], 4),
+            "cv_qini_ci95": [round(v, 4) for v in cv_results[best_key]["qini_ci95"]],
+            "holdout": {k: round(v, 4) for k, v in holdout.as_dict().items()},
+            "holdout_qini_bootstrap_ci95": [round(boot_lo, 4), round(boot_hi, 4)],
+            "response_roc_auc": round(resp_auc, 4),
+        }
+        with open(os.path.join(OUT_DIR, "metrics_report.json"), "w") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        logger.info("saved metrics report -> %s/metrics_report.json", OUT_DIR)
+        logger.info("FINAL REPORT:\n%s", json.dumps(report, indent=2, ensure_ascii=False))
+
+    logger.info("PIPELINE FINISHED OK in %.2fs", time.perf_counter() - pipeline_t0)
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--comm", default=None, help="communications CSV path")
+    parser.add_argument("--purch", default=None, help="purchases CSV path")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="console log verbosity (default INFO)")
+    parser.add_argument("--log-file", default=None,
+                        help="optional path to also write logs to a file")
+    args = parser.parse_args()
+
+    setup_logging(args.log_level, args.log_file)
+    logger.info("uplift pipeline starting | cutoff=%s | holdout>=%s | log-level=%s",
+                CUTOFF.date(), TEST_SPLIT_DATE.date(), args.log_level)
+    try:
+        run_pipeline(args)
+    except Exception:
+        logger.exception("PIPELINE ABORTED due to an unhandled error (see traceback above)")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

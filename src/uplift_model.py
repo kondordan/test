@@ -20,6 +20,7 @@ Anti-overfitting practices applied here:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -34,6 +35,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from sklift.metrics import qini_auc_score, uplift_at_k, uplift_auc_score
+
+logger = logging.getLogger(__name__)
 
 RANDOM_STATE = 42
 
@@ -122,7 +125,7 @@ def cross_val_uplift(model_name, base_kind, preprocessor, X, treatment, target,
     tv = treatment.reset_index(drop=True)
     yv = target.reset_index(drop=True)
 
-    for tr_idx, va_idx in skf.split(Xv, strat):
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(Xv, strat), 1):
         pre = build_preprocessor(*preprocessor)
         X_tr = pre.fit_transform(Xv.iloc[tr_idx])
         X_va = pre.transform(Xv.iloc[va_idx])
@@ -135,6 +138,8 @@ def cross_val_uplift(model_name, base_kind, preprocessor, X, treatment, target,
         qinis.append(res.qini)
         auucs.append(res.auuc)
         upk.append(res.uplift_at_30)
+        logger.debug("    fold %d/%d: Qini=%.4f AUUC=%.4f uplift@30%%=%.4f",
+                     fold, n_splits, res.qini, res.auuc, res.uplift_at_30)
 
     qinis = np.array(qinis)
     return {

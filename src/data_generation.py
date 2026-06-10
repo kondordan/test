@@ -22,8 +22,12 @@ pipeline at the real CSV files with the same columns.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 DISCOUNT_COL = "Есть ли скидка в рублях"
 
@@ -56,6 +60,8 @@ def generate(
     history_start = pd.Timestamp(history_start)
     cutoff = pd.Timestamp(cutoff)
     horizon_days = (cutoff - history_start).days
+    logger.info("generating synthetic data: n_customers=%d, period %s..%s, seed=%d",
+                n_customers, history_start.date(), cutoff.date(), seed)
 
     emails = np.array([f"user{idx:05d}@mail.ru" for idx in range(n_customers)])
 
@@ -107,6 +113,7 @@ def generate(
             "claim_sum_usd", "adult", "pax", "state_name",
         ],
     )
+    logger.info("purchases table built: %d rows", len(purchases))
 
     # =======================================================================
     # 2) COMMUNICATIONS TABLE
@@ -117,9 +124,13 @@ def generate(
         history_start + pd.Timedelta(days=int(d))
         for d in rng.integers(30, horizon_days, n_campaigns)
     )
+    logger.info("simulating %d campaigns ...", n_campaigns)
 
     c_rows = []
     for c_idx, c_date in enumerate(campaign_dates):
+        if c_idx % 20 == 0:
+            logger.debug("  campaign %d/%d @ %s (rows so far=%d)",
+                         c_idx, n_campaigns, c_date.date(), len(c_rows))
         mailing_name = MAILING_NAMES[c_idx % len(MAILING_NAMES)]
         # Send to ~25% of the base, biased a bit towards engaged customers.
         send_p = 0.15 + 0.25 * base_engagement
@@ -208,6 +219,7 @@ def generate(
     # Enforce the "strictly before cutoff" invariant for every dated column.
     communications = communications[communications["mailing_date"] < cutoff].reset_index(drop=True)
     purchases = purchases[purchases["date_booking"] < cutoff].reset_index(drop=True)
+    logger.info("communications table built: %d rows", len(communications))
 
     return communications, purchases
 

@@ -11,10 +11,14 @@ time the current mailing is sent), but only via an expanding window shifted by 1
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
 from data_generation import DISCOUNT_COL
+
+logger = logging.getLogger(__name__)
 
 DATE_COLS_COMM = ["mailing_date", "open_date", "click_date", "purchase_date", "trip_date"]
 DATE_COLS_PURCH = ["date_booking", "date_begin"]
@@ -120,6 +124,8 @@ def build_dataset(comm: pd.DataFrame, purch: pd.DataFrame):
     """
     comm = _ensure_datetime(comm, DATE_COLS_COMM)
     purch = _ensure_datetime(purch, DATE_COLS_PURCH)
+    logger.info("building features for %d mailings using %d purchases ...",
+                len(comm), len(purch))
 
     treatment = (comm[DISCOUNT_COL].fillna(0) > 0).astype(int)
     target = comm["click_date"].notna().astype(int)
@@ -135,9 +141,11 @@ def build_dataset(comm: pd.DataFrame, purch: pd.DataFrame):
     feat["discount_rub"] = comm[DISCOUNT_COL].fillna(0).astype(float)
 
     # ---- client purchase-history features (leakage-free) ----
+    logger.debug("computing as-of purchase-history features ...")
     feat = pd.concat([feat, _purchase_history_features(comm, purch)], axis=1)
 
     # ---- client prior-mailing engagement (leakage-free, expanding) ----
+    logger.debug("computing prior-mailing engagement features ...")
     feat = pd.concat([feat, _past_mailing_features(comm)], axis=1)
 
     # ---- categoricals ----
@@ -149,6 +157,8 @@ def build_dataset(comm: pd.DataFrame, purch: pd.DataFrame):
 
     numeric_cols = feat.columns.tolist()
     categorical_cols = cat.columns.tolist()
+    logger.info("features ready: target click_rate=%.4f, treated share=%.4f",
+                target.mean(), treatment.mean())
 
     meta = pd.DataFrame({
         "email": comm["email"].to_numpy(),

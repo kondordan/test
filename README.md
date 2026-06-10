@@ -37,6 +37,24 @@ python script.py --comm my_comm.csv --purch my_purchases.csv   # ваши дан
 `uplift_by_percentile.png`, `client_uplift_scores.csv` (uplift на клиента),
 `decile_lift_table.csv`.
 
+### Логи и отслеживание выполнения
+
+Пайплайн пишет подробный лог в консоль через модуль `logging`: каждый из 8 этапов
+помечается `[START]`/`[DONE]` с таймингом, выводятся промежуточные метрики (баланс
+treatment/control, `click_rate`, размеры выборок, Qini по фолдам, метрики холдаута).
+При ошибке печатается полный traceback и причина, процесс завершается кодом `1`.
+
+```bash
+python script.py --log-level DEBUG          # детальнее (метрики по каждому CV-фолду)
+python script.py --log-file outputs/run.log # дублировать логи в файл
+python script.py --comm a.csv --purch b.csv --log-file run.log
+```
+
+Перед запуском проверяется схема входных таблиц — если не хватает колонки, скрипт
+сразу падает с понятным сообщением (например, `communications table is missing
+columns: ['click_date']`). Также проверяется непустота выборок, наличие обеих групп
+(со скидкой и без) и непустой холдаут.
+
 ## Как устроен пайплайн
 
 1. **Загрузка + отсечка по дате.** Используются только данные **строго до 01.08.2026**
