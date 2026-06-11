@@ -379,11 +379,9 @@ def run_pipeline(args) -> dict:
                     split_kind, len(X_train), int(t_train.sum()), y_train.mean(),
                     len(X_test), int(t_test.sum()),
                     y_test.mean() if len(X_test) else float("nan"))
-        if args.balance:
-            logger.info("balancing training set (keep all promo + %.2fx no-promo) ...",
-                        args.balance_ratio)
-            X_train, t_train, y_train = balance_training_set(
-                X_train, t_train, y_train, args.balance_ratio)
+        # Keep the raw (unbalanced) train; balancing (and any ratio sweep) is
+        # applied inside model selection below.
+        X_train_raw, t_train_raw, y_train_raw = X_train, t_train, y_train
 
     # ---------------- 4) CV model selection ----------------
     candidates = [
@@ -392,30 +390,58 @@ def run_pipeline(args) -> dict:
         ("ClassTransformation", "hgb"),
         ("SoloModel", "logreg"),
     ]
+    # Build the grid of balance ratios to consider.
+    if not args.balance:
+        ratio_grid = [None]                       # no balancing
+    elif args.balance_ratios:
+        ratio_grid = [float(x) for x in args.balance_ratios.split(",") if x.strip()]
+    else:
+        ratio_grid = [args.balance_ratio]          # single ratio, no sweep
+
     cv_results = {}
-    with log_stage("4/10 cross-validated model selection (5-fold)"):
-        # On very large training sets, model SELECTION is done on a random
-        # sample for speed/memory; the WINNER is later refit on the FULL train.
-        Xcv, tcv, ycv = X_train, t_train, y_train
-        if len(X_train) > args.max_cv_rows:
-            rng = np.random.default_rng(42)
-            sample_idx = rng.choice(len(X_train), size=args.max_cv_rows, replace=False)
-            Xcv = X_train.iloc[sample_idx]
-            tcv = t_train.iloc[sample_idx]
-            ycv = y_train.iloc[sample_idx]
-            logger.info("train has %d rows -> CV model selection on a %d-row sample "
-                        "(winner refit on full train).", len(X_train), args.max_cv_rows)
-        for i, (name, base) in enumerate(candidates, 1):
-            logger.info("CV candidate %d/%d: %s [%s] ...", i, len(candidates), name, base)
-            cv = cross_val_uplift(name, base, preprocessor, Xcv, tcv, ycv)
-            cv_results[f"{name}+{base}"] = cv
-            lo, hi = cv["qini_ci95"]
-            logger.info("  -> Qini=%.4f +/- %.4f (95%% CI [%.4f, %.4f]) uplift@30%%=%.4f",
-                        cv["qini_mean"], cv["qini_std"], lo, hi, cv["uplift_at_30_mean"])
-        best_key = max(cv_results, key=lambda k: cv_results[k]["qini_mean"])
-        best_name, best_base = best_key.split("+")
-        logger.info("best model by CV Qini: %s (%.4f)",
-                    best_key, cv_results[best_key]["qini_mean"])
+    sweep_rows = []
+    with log_stage("4/10 cross-validated selection (model x balance-ratio)"):
+        rng = np.random.default_rng(42)
+        for ratio in ratio_grid:
+            # balance the raw train at this ratio (None = keep natural)
+            if ratio is None:
+                Xb, tb, yb = X_train_raw, t_train_raw, y_train_raw
+            else:
+                Xb, tb, yb = balance_training_set(X_train_raw, t_train_raw,
+                                                  y_train_raw, ratio)
+            # cap rows used for CV (selection only; winner refit on full train)
+            if len(Xb) > args.max_cv_rows:
+                idx = rng.choice(len(Xb), size=args.max_cv_rows, replace=False)
+                Xb, tb, yb = Xb.iloc[idx], tb.iloc[idx], yb.iloc[idx]
+            for name, base in candidates:
+                cv = cross_val_uplift(name, base, preprocessor, Xb, tb, yb)
+                key = (ratio, name, base)
+                cv_results[key] = cv
+                lo, hi = cv["qini_ci95"]
+                logger.info("  ratio=%s %s[%s]: Qini=%.4f +/- %.4f "
+                            "(95%% CI [%.4f, %.4f]) uplift@30%%=%.4f",
+                            ratio, name, base, cv["qini_mean"], cv["qini_std"],
+                            lo, hi, cv["uplift_at_30_mean"])
+                sweep_rows.append({"balance_ratio": ratio, "model": f"{name}+{base}",
+                                   "cv_qini_mean": round(cv["qini_mean"], 4),
+                                   "cv_qini_std": round(cv["qini_std"], 4)})
+
+        best_key_tuple = max(cv_results, key=lambda k: cv_results[k]["qini_mean"])
+        best_ratio, best_name, best_base = best_key_tuple
+        best_key = f"{best_name}+{best_base}"
+        if len(ratio_grid) > 1:
+            logger.info("ratio sweep results:\n%s",
+                        pd.DataFrame(sweep_rows).to_string(index=False))
+        logger.info("BEST by CV Qini: model=%s, balance_ratio=%s (Qini=%.4f)",
+                    best_key, best_ratio, cv_results[best_key_tuple]["qini_mean"])
+
+        # Materialise the FULL training set at the chosen ratio for the ensemble.
+        if best_ratio is None:
+            X_train, t_train, y_train = X_train_raw, t_train_raw, y_train_raw
+        else:
+            X_train, t_train, y_train = balance_training_set(
+                X_train_raw, t_train_raw, y_train_raw, best_ratio)
+        best_cv = cv_results[best_key_tuple]
 
     # ---------------- 5) train 3-model ensemble + holdout evaluation ----------------
     with log_stage(f"5/10 train {args.n_models}-model ensemble ({best_key}) + holdout eval"):
@@ -519,11 +545,12 @@ def run_pipeline(args) -> dict:
             "best_model": best_key,
             "holdout_split": split_kind,
             "balanced_training": bool(args.balance),
-            "balance_ratio": args.balance_ratio if args.balance else None,
+            "balance_ratio": best_ratio,
+            "balance_ratio_tuned": bool(args.balance and args.balance_ratios),
             "n_train_rows": int(len(X_train)),
             "n_ensemble_models": args.n_models,
-            "cv_qini_mean": round(cv_results[best_key]["qini_mean"], 4),
-            "cv_qini_ci95": [round(v, 4) for v in cv_results[best_key]["qini_ci95"]],
+            "cv_qini_mean": round(best_cv["qini_mean"], 4),
+            "cv_qini_ci95": [round(v, 4) for v in best_cv["qini_ci95"]],
             "holdout": {k: round(v, 4) for k, v in holdout.as_dict().items()},
             "holdout_qini_bootstrap_ci95": [round(boot_lo, 4), round(boot_hi, 4)],
             "response_roc_auc": round(resp_auc, 4),
@@ -724,6 +751,10 @@ def main():
     parser.add_argument("--balance-ratio", type=float, default=2.0,
                         help="non-promo : promo ratio when --balance is on "
                              "(default 2.0 = twice as many non-promo as promo)")
+    parser.add_argument("--balance-ratios", type=str, default=None,
+                        help="comma-separated grid to TUNE the ratio by CV Qini, "
+                             "e.g. '1,2,3,5'. Requires --balance. Overrides "
+                             "--balance-ratio; the best ratio is chosen automatically.")
     args = parser.parse_args()
 
     setup_logging(args.log_level, args.log_file)
