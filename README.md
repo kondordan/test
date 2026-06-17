@@ -64,6 +64,23 @@ python predict.py --comm comm.csv --purch purchases.csv \
                   --out outputs/send_recommendations.csv
 ```
 
+### Графики результатов кампании (A/B)
+
+После проведения кампании (есть факт открытий/кликов/покупок) можно построить
+наглядные сравнительные графики «группа A (отправили рекомендацию, `flag=ИСТИНА`)
+против группы B (`ЛОЖЬ`)»:
+
+```bash
+python plot_campaign_results.py --results outputs/campaign_results.csv
+```
+
+Ожидаемые колонки: `email, flag, open_date, click_date` (+ опционально `claim`).
+Открытие — `open_date > 0`, клик — `click_date > 0`, покупка — `claim > 0`.
+Метрики нормируются на число уникальных email в группе: уник. email, клики,
+OpenRate, ClickRate, CTOR; при наличии `claim` — ещё покупки и Conversion
+(покупки / размер группы). Сохраняются `outputs/campaign_engagement.png` и
+`outputs/campaign_engagement_with_purchases.png`.
+
 ### Балансировка обучающей выборки (опционально)
 
 Скидки в реальных данных редкие (~0.8%). Чтобы модель «увидела» сигнал
@@ -255,6 +272,7 @@ CV даёт интервал стабильности, bootstrap — интер�
 ```
 script.py                 # обучение: данные -> признаки -> CV -> ансамбль -> сохранение -> рекомендации
 predict.py                # отдельный скоринг по сохранённой модели (без обучения)
+plot_campaign_results.py  # графики результатов кампании: группа A (рекомендация) vs B (контроль)
 src/data_generation.py    # синтетические данные по схеме задачи
 src/features.py           # инжиниринг признаков без утечек
 src/uplift_model.py       # препроцессинг, мета-обучатели, ансамбль, save/load, метрики, CV, bootstrap
