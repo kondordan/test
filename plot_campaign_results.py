@@ -121,10 +121,13 @@ def _grid(n: int, milestones: list[int], n_points: int = 1500) -> np.ndarray:
     return np.unique(np.concatenate([base, ms])) if len(ms) else np.unique(base)
 
 
-def _add_milestones(ax, milestones: list[int], n: int):
-    """Вертикальные линии-ориентиры размера группы A (без засорения легенды)."""
+def _add_milestones(ax, milestones: list[int], upper: float):
+    """Вертикальные линии-ориентиры размера группы A (без засорения легенды).
+
+    Линии за пределами видимой области (``upper``) не рисуются, чтобы не было
+    «висящих» подписей вне осей."""
     for m, c in zip(milestones, MILESTONE_COLORS):
-        if m > n:
+        if m > upper:
             continue
         ax.axvline(m, color=c, ls="--", lw=1.4, alpha=0.7)
         ax.text(m, 0.99, f" {m // 1000}к", color=c, fontsize=8, fontweight="bold",
@@ -155,10 +158,13 @@ def _plot_ab(ax, g, a_vals, b_vals, color):
     ax.plot(g, b_vals, color=color, lw=1.8, ls="--", alpha=0.9)  # B — пунктир
 
 
-def plot_chart(metrics: dict, milestones: list[int], with_purch: bool, out_path: str):
+def plot_chart(metrics: dict, milestones: list[int], with_purch: bool, out_path: str,
+               xmax: float | None = None, ymax_pct: float | None = None,
+               ymax_count: float | None = None):
     n = metrics["n"]
     g = _grid(n, milestones)
     ab = _ab_at(metrics, g, with_purch)
+    x_upper = xmax if xmax is not None else n   # видимая граница по X (для milestone)
 
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(13, 9.5), sharex=True)
 
@@ -175,7 +181,7 @@ def plot_chart(metrics: dict, milestones: list[int], with_purch: bool, out_path:
     ax_top.set_ylabel("Доля, %")
     ax_top.set_title("Относительные метрики: группа A vs группа B",
                      fontsize=12, fontweight="bold")
-    _add_milestones(ax_top, milestones, n)
+    _add_milestones(ax_top, milestones, x_upper)
     _style_x(ax_top)
     _ab_legend(ax_top, rate_specs, loc="upper right", ncol=2)
 
@@ -189,9 +195,18 @@ def plot_chart(metrics: dict, milestones: list[int], with_purch: bool, out_path:
     ax_bot.set_ylabel("Количество")
     ax_bot.set_title("Абсолютные счётчики: группа A vs группа B",
                      fontsize=12, fontweight="bold")
-    _add_milestones(ax_bot, milestones, n)
+    _add_milestones(ax_bot, milestones, x_upper)
     _style_x(ax_bot)
     _ab_legend(ax_bot, cnt_specs, loc="center right", ncol=1)
+
+    # --- настраиваемые пределы осей (по умолчанию авто) ---
+    if xmax is not None:
+        ax_top.set_xlim(0, xmax)
+        ax_bot.set_xlim(0, xmax)
+    if ymax_pct is not None:
+        ax_top.set_ylim(0, ymax_pct)
+    if ymax_count is not None:
+        ax_bot.set_ylim(0, ymax_count)
 
     title = ("Сравнение групп A и B в зависимости от размера группы A"
              + (" — с покупками" if with_purch else ""))
@@ -235,6 +250,21 @@ def main():
     parser.add_argument("--sep", default=",")
     parser.add_argument("--milestones", default=",".join(map(str, DEFAULT_MILESTONES)),
                         help="размеры группы A для вертикальных линий, через запятую")
+    # --- настраиваемые пределы осей (по умолчанию None = авто/весь диапазон) ---
+    # График вовлечённости:
+    parser.add_argument("--eng-xmax", type=float, default=None,
+                        help="макс. по оси X (число email) для графика вовлечённости")
+    parser.add_argument("--eng-ymax", type=float, default=None,
+                        help="макс. по оси Y в %% (верхняя панель) для графика вовлечённости, напр. 80")
+    parser.add_argument("--eng-ymax-count", type=float, default=None,
+                        help="макс. по оси Y (счётчики, нижняя панель) для графика вовлечённости")
+    # График с покупками:
+    parser.add_argument("--pur-xmax", type=float, default=None,
+                        help="макс. по оси X (число email) для графика с покупками")
+    parser.add_argument("--pur-ymax", type=float, default=None,
+                        help="макс. по оси Y в %% (верхняя панель) для графика с покупками")
+    parser.add_argument("--pur-ymax-count", type=float, default=None,
+                        help="макс. по оси Y (счётчики, нижняя панель) для графика с покупками")
     args = parser.parse_args()
 
     df = pd.read_csv(args.results, sep=args.sep)
@@ -255,7 +285,8 @@ def main():
     print("\n=== Метрики на ключевых размерах группы A (вовлечённость) ===")
     print(milestone_table(m_eng, milestones, has_purch=False).to_string(index=False))
     plot_chart(m_eng, milestones, with_purch=False,
-               out_path=os.path.join(args.out_dir, "campaign_engagement.png"))
+               out_path=os.path.join(args.out_dir, "campaign_engagement.png"),
+               xmax=args.eng_xmax, ymax_pct=args.eng_ymax, ymax_count=args.eng_ymax_count)
 
     # График 2 — с покупками (если есть claim_id)
     if claim_col:
@@ -263,7 +294,8 @@ def main():
         print("\n=== Метрики на ключевых размерах группы A (с покупками) ===")
         print(milestone_table(m_all, milestones, has_purch=True).to_string(index=False))
         plot_chart(m_all, milestones, with_purch=True,
-                   out_path=os.path.join(args.out_dir, "campaign_engagement_with_purchases.png"))
+                   out_path=os.path.join(args.out_dir, "campaign_engagement_with_purchases.png"),
+                   xmax=args.pur_xmax, ymax_pct=args.pur_ymax, ymax_count=args.pur_ymax_count)
     else:
         print("\n[i] колонки 'claim_id' нет -> график с покупками пропущен.")
 
