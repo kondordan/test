@@ -51,6 +51,9 @@ def main():
     parser.add_argument("--chunksize", type=int, default=1_000_000)
     parser.add_argument("--sample-rows", type=int, default=3_000_000)
     parser.add_argument("--sample-frac", type=float, default=None)
+    parser.add_argument("--send-threshold", type=float, default=None,
+                        help="override the send cutoff; default = value saved with "
+                             "the model (optimal threshold from training).")
     args = parser.parse_args()
 
     trainer.setup_logging(args.log_level, args.log_file)
@@ -73,8 +76,14 @@ def main():
 
         X, _treatment, _target, _num, _cat, meta = build_dataset(comm, purch)
 
+        # Use the optimal threshold saved with the model (or a manual override).
+        threshold = (args.send_threshold if args.send_threshold is not None
+                     else float(payload.get("extra", {}).get("send_threshold", 0.0)))
+        logger.info("send threshold = %.5f (%s)", threshold,
+                    "manual" if args.send_threshold is not None else "from saved model")
+
         reco = trainer.build_send_recommendations(payload["members"], X, meta,
-                                                  comm, purch)
+                                                  comm, purch, threshold=threshold)
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         reco.to_csv(args.out, index=False)
 

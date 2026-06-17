@@ -214,6 +214,46 @@ def bootstrap_qini_ci(y_true, uplift, treatment, n_boot: int = 200,
     return float(np.percentile(scores, 2.5)), float(np.percentile(scores, 97.5)), float(scores.mean())
 
 
+def choose_uplift_threshold(y_true, uplift, treatment):
+    """Pick the OPTIMAL predicted-uplift cutoff above which to send.
+
+    Clients are ranked by predicted uplift (high -> low). We accumulate the
+    Qini-style incremental clicks (treated responders minus control responders,
+    rescaled by group sizes) and take the cutoff at the PEAK of that curve:
+    beyond this point, adding lower-uplift clients reduces total incremental
+    clicks. The predicted-uplift value at the peak is the threshold.
+
+    Returns (threshold, info). Falls back to 0.0 if a treatment arm is missing.
+    """
+    y = np.asarray(y_true, dtype=float)
+    u = np.asarray(uplift, dtype=float)
+    t = np.asarray(treatment)
+    uniq = np.unique(t)
+    if not (0 in uniq and 1 in uniq) or len(u) == 0:
+        logger.warning("choose_uplift_threshold: one treatment arm missing -> "
+                       "defaulting threshold to 0.0")
+        return 0.0, {"targeted_fraction": float("nan"),
+                     "max_incremental_clicks": float("nan")}
+
+    order = np.argsort(-u, kind="mergesort")  # high uplift first
+    us, ts, ys = u[order], t[order], y[order]
+    treat = (ts == 1).astype(float)
+    ctrl = (ts == 0).astype(float)
+    cum_tr = np.cumsum(ys * treat)            # cumulative treated responders
+    cum_tn = np.cumsum(treat)                 # cumulative treated count
+    cum_cr = np.cumsum(ys * ctrl)             # cumulative control responders
+    cum_cn = np.cumsum(ctrl)                  # cumulative control count
+    # Qini-style cumulative incremental responses if we target the top-k clients.
+    inc = cum_tr - cum_cr * (cum_tn / np.maximum(cum_cn, 1.0))
+    best = int(np.argmax(inc))
+    threshold = float(us[best])
+    info = {
+        "targeted_fraction": (best + 1) / len(u),
+        "max_incremental_clicks": float(inc[best]),
+    }
+    return threshold, info
+
+
 def train_ensemble(model_name, base_kind, preprocessor_cols, X_train, t_train,
                    y_train, n_models: int = 3, frac: float = 0.8, seed: int = 42):
     """Train ``n_models`` of the chosen meta-learner, each on a DIFFERENT random

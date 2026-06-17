@@ -48,6 +48,7 @@ from data_generation import DISCOUNT_COL, generate  # noqa: E402
 from features import build_dataset  # noqa: E402
 from uplift_model import (  # noqa: E402
     bootstrap_qini_ci,
+    choose_uplift_threshold,
     cross_val_uplift,
     evaluate_uplift,
     predict_ensemble,
@@ -463,6 +464,19 @@ def run_pipeline(args) -> dict:
         logger.info("HOLDOUT AUUC=%.4f | uplift@30%%=%.4f | response ROC-AUC=%.4f",
                     holdout.auuc, holdout.uplift_at_30, resp_auc)
 
+        # Optimal send-threshold: cutoff on predicted uplift that maximises
+        # cumulative incremental clicks on the holdout (peak of the uplift curve).
+        if args.send_threshold is not None:
+            send_threshold = float(args.send_threshold)
+            thr_info = {"targeted_fraction": float("nan")}
+            logger.info("send threshold set manually = %.5f", send_threshold)
+        else:
+            send_threshold, thr_info = choose_uplift_threshold(
+                y_test.to_numpy(), uplift_test, t_test.to_numpy())
+            logger.info("optimal send threshold = %.5f (would target ~%.1f%% of "
+                        "the holdout; previously threshold was 0)",
+                        send_threshold, 100 * thr_info.get("targeted_fraction", float("nan")))
+
     # ---------------- 6) persist the ensemble to disk ----------------
     with log_stage("6/10 save trained ensemble to disk"):
         model_path = os.path.join(MODEL_DIR, "uplift_ensemble.joblib")
@@ -470,7 +484,8 @@ def run_pipeline(args) -> dict:
                       num_cols, cat_cols,
                       extra={"cutoff": str(CUTOFF.date()),
                              "test_split_date": str(TEST_SPLIT_DATE.date()),
-                             "holdout_qini": round(holdout.qini, 4)})
+                             "holdout_qini": round(holdout.qini, 4),
+                             "send_threshold": send_threshold})
 
     # ---------------- 7) plots ----------------
     with log_stage("7/10 save plots"):
@@ -523,7 +538,8 @@ def run_pipeline(args) -> dict:
 
     # ---------------- 9) send recommendations for every email ----------------
     with log_stage("9/10 build send-recommendations per email"):
-        reco = build_send_recommendations(members, X, meta, comm, purch)
+        reco = build_send_recommendations(members, X, meta, comm, purch,
+                                          threshold=send_threshold)
         reco_path = os.path.join(OUT_DIR, "send_recommendations.csv")
         reco.to_csv(reco_path, index=False)
         n_send = int(reco["recommend_send"].sum())
@@ -554,6 +570,8 @@ def run_pipeline(args) -> dict:
             "holdout": {k: round(v, 4) for k, v in holdout.as_dict().items()},
             "holdout_qini_bootstrap_ci95": [round(boot_lo, 4), round(boot_hi, 4)],
             "response_roc_auc": round(resp_auc, 4),
+            "send_threshold": round(float(send_threshold), 5),
+            "send_threshold_auto": bool(args.send_threshold is None),
             "n_emails_scored": int(len(reco)),
             "n_recommended_send": int(reco["recommend_send"].sum()),
             "n_excluded_upcoming_trip": int(reco["has_upcoming_trip"].sum()),
@@ -679,14 +697,16 @@ def emails_with_upcoming_trip(purch: pd.DataFrame, cutoff: pd.Timestamp) -> set:
     return set(upcoming)
 
 
-def build_send_recommendations(members, X, meta, comm, purch) -> pd.DataFrame:
+def build_send_recommendations(members, X, meta, comm, purch,
+                               threshold: float = 0.0) -> pd.DataFrame:
     """For every e-mail in the dataset decide whether to send an uplift mailing.
 
     - score every mailing row with the ensemble, average per e-mail to get the
       client's discount-responsiveness (uplift);
     - exclude clients who already bought a tour but have not travelled yet as of
       the cutoff;
-    - recommend sending when uplift > 0 and the client is not excluded.
+    - recommend sending when uplift >= ``threshold`` (optimal cutoff chosen on
+      the holdout, see choose_uplift_threshold) and the client is not excluded.
     """
     uplift_all = predict_ensemble(members, X)
     df = pd.DataFrame({
@@ -700,7 +720,8 @@ def build_send_recommendations(members, X, meta, comm, purch) -> pd.DataFrame:
     upcoming = emails_with_upcoming_trip(purch, CUTOFF)
     per_email["has_upcoming_trip"] = per_email["email"].isin(upcoming)
     per_email["recommend_send"] = (
-        (~per_email["has_upcoming_trip"]) & (per_email["mean_predicted_uplift"] > 0)
+        (~per_email["has_upcoming_trip"])
+        & (per_email["mean_predicted_uplift"] >= threshold)
     )
     per_email = per_email.sort_values(
         ["recommend_send", "mean_predicted_uplift"], ascending=[False, False]
@@ -755,6 +776,9 @@ def main():
                         help="comma-separated grid to TUNE the ratio by CV Qini, "
                              "e.g. '1,2,3,5'. Requires --balance. Overrides "
                              "--balance-ratio; the best ratio is chosen automatically.")
+    parser.add_argument("--send-threshold", type=float, default=None,
+                        help="uplift cutoff above which to recommend sending. "
+                             "Default = auto (optimal cutoff chosen on the holdout).")
     args = parser.parse_args()
 
     setup_logging(args.log_level, args.log_file)
