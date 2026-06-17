@@ -73,23 +73,45 @@ def prepare(df: pd.DataFrame, claim_col: str | None):
 
 
 def cumulative_metrics(per: pd.DataFrame, has_purch: bool) -> dict:
-    """Накопленные метрики группы A для k = 1..N (A = топ-k по uplift)."""
+    """Накопленные счётчики (для k=1..N, где A = топ-k по uplift)."""
     n = len(per)
-    k = np.arange(1, n + 1)
     cum_open = np.cumsum(per["opened"].to_numpy())
     cum_click = np.cumsum(per["clicked"].to_numpy())
-    out = {
-        "k": k,
-        "clicks": cum_click,
-        "open_rate": cum_open / k,
-        "click_rate": cum_click / k,
-        "ctor": np.divide(cum_click, np.maximum(cum_open, 1)),
+    out = {"k": np.arange(1, n + 1), "n": n,
+           "cum_open": cum_open, "cum_click": cum_click}
+    if has_purch:
+        out["cum_purch"] = np.cumsum(per["purchased"].to_numpy())
+    return out
+
+
+def _ab_at(metrics: dict, g: np.ndarray, has_purch: bool) -> dict:
+    """Метрики групп A (топ-g) и B (остальные n-g) на сетке размеров g."""
+    n = metrics["n"]
+    idx = g - 1
+    nb = (n - g).astype(float)
+    nb_safe = np.where(nb > 0, nb, np.nan)        # B пустая при g==n -> NaN
+
+    opens_a = metrics["cum_open"][idx].astype(float)
+    clicks_a = metrics["cum_click"][idx].astype(float)
+    tot_open = float(metrics["cum_open"][-1])
+    tot_click = float(metrics["cum_click"][-1])
+    opens_b = tot_open - opens_a
+    clicks_b = tot_click - clicks_a
+
+    res = {
+        "open_rate": (opens_a / g, opens_b / nb_safe),
+        "click_rate": (clicks_a / g, clicks_b / nb_safe),
+        "ctor": (clicks_a / np.maximum(opens_a, 1),
+                 np.where(opens_b > 0, clicks_b / np.maximum(opens_b, 1), np.nan)),
+        "clicks": (clicks_a, clicks_b),
     }
     if has_purch:
-        cum_purch = np.cumsum(per["purchased"].to_numpy())
-        out["purchases"] = cum_purch
-        out["conversion"] = cum_purch / k
-    return out
+        purch_a = metrics["cum_purch"][idx].astype(float)
+        tot_purch = float(metrics["cum_purch"][-1])
+        purch_b = tot_purch - purch_a
+        res["conversion"] = (purch_a / g, purch_b / nb_safe)
+        res["purchases"] = (purch_a, purch_b)
+    return res
 
 
 def _grid(n: int, milestones: list[int], n_points: int = 1500) -> np.ndarray:
@@ -100,11 +122,14 @@ def _grid(n: int, milestones: list[int], n_points: int = 1500) -> np.ndarray:
 
 
 def _add_milestones(ax, milestones: list[int], n: int):
+    """Вертикальные линии-ориентиры размера группы A (без засорения легенды)."""
     for m, c in zip(milestones, MILESTONE_COLORS):
         if m > n:
             continue
-        ax.axvline(m, color=c, ls="--", lw=1.6, alpha=0.9,
-                   label=f"A = {_thousands(m)} email")
+        ax.axvline(m, color=c, ls="--", lw=1.4, alpha=0.7)
+        ax.text(m, 0.99, f" {m // 1000}к", color=c, fontsize=8, fontweight="bold",
+                rotation=90, va="top", ha="left",
+                transform=ax.get_xaxis_transform())
 
 
 def _style_x(ax):
@@ -114,42 +139,61 @@ def _style_x(ax):
     ax.set_axisbelow(True)
 
 
+def _ab_legend(ax, metric_specs, loc, ncol):
+    """Легенда: цвет = метрика, стиль линии = группа (A сплошная / B пунктир)."""
+    from matplotlib.lines import Line2D
+    handles = [Line2D([], [], color=c, lw=2.2, label=name) for name, c in metric_specs]
+    handles += [
+        Line2D([], [], color="#444", lw=2.2, ls="-", label="Группа A (топ по uplift)"),
+        Line2D([], [], color="#444", lw=1.8, ls="--", label="Группа B (остальные)"),
+    ]
+    ax.legend(handles=handles, loc=loc, fontsize=9, ncol=ncol, framealpha=0.9)
+
+
+def _plot_ab(ax, g, a_vals, b_vals, color):
+    ax.plot(g, a_vals, color=color, lw=2.2, ls="-")          # A — сплошная
+    ax.plot(g, b_vals, color=color, lw=1.8, ls="--", alpha=0.9)  # B — пунктир
+
+
 def plot_chart(metrics: dict, milestones: list[int], with_purch: bool, out_path: str):
-    n = int(metrics["k"][-1])
+    n = metrics["n"]
     g = _grid(n, milestones)
-    idx = g - 1
+    ab = _ab_at(metrics, g, with_purch)
 
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(13, 9.5), sharex=True)
 
-    # --- верх: относительные метрики (%) ---
-    ax_top.plot(g, metrics["open_rate"][idx] * 100, color="#1f77b4", lw=2.2, label="OpenRate")
-    ax_top.plot(g, metrics["click_rate"][idx] * 100, color="#2ca02c", lw=2.2, label="ClickRate")
-    ax_top.plot(g, metrics["ctor"][idx] * 100, color="#8c564b", lw=2.2, label="CTOR (клик/открытие)")
+    # --- верх: относительные метрики (%), A vs B ---
+    rate_specs = [("OpenRate", "#1f77b4"), ("ClickRate", "#2ca02c"),
+                  ("CTOR (клик/открытие)", "#8c564b")]
+    _plot_ab(ax_top, g, ab["open_rate"][0] * 100, ab["open_rate"][1] * 100, "#1f77b4")
+    _plot_ab(ax_top, g, ab["click_rate"][0] * 100, ab["click_rate"][1] * 100, "#2ca02c")
+    _plot_ab(ax_top, g, ab["ctor"][0] * 100, ab["ctor"][1] * 100, "#8c564b")
     if with_purch:
-        ax_top.plot(g, metrics["conversion"][idx] * 100, color="#e377c2", lw=2.2,
-                    label="Conversion (покупки/группа)")
+        _plot_ab(ax_top, g, ab["conversion"][0] * 100, ab["conversion"][1] * 100, "#e377c2")
+        rate_specs.append(("Conversion (покупки/группа)", "#e377c2"))
     ax_top.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:.1f}%"))
-    ax_top.set_ylabel("Доля по группе A, %")
-    ax_top.set_title("Относительные метрики группы A в зависимости от её размера",
+    ax_top.set_ylabel("Доля, %")
+    ax_top.set_title("Относительные метрики: группа A vs группа B",
                      fontsize=12, fontweight="bold")
     _add_milestones(ax_top, milestones, n)
     _style_x(ax_top)
-    ax_top.legend(loc="upper right", fontsize=9, ncol=2)
+    _ab_legend(ax_top, rate_specs, loc="upper right", ncol=2)
 
-    # --- низ: абсолютные счётчики ---
-    ax_bot.plot(g, metrics["clicks"][idx], color="#2ca02c", lw=2.2, label="Количество кликов")
+    # --- низ: абсолютные счётчики, A vs B ---
+    cnt_specs = [("Клики", "#2ca02c")]
+    _plot_ab(ax_bot, g, ab["clicks"][0], ab["clicks"][1], "#2ca02c")
     if with_purch:
-        ax_bot.plot(g, metrics["purchases"][idx], color="#e377c2", lw=2.2,
-                    label="Количество покупок")
+        _plot_ab(ax_bot, g, ab["purchases"][0], ab["purchases"][1], "#e377c2")
+        cnt_specs.append(("Покупки", "#e377c2"))
     ax_bot.yaxis.set_major_formatter(FuncFormatter(_thousands))
-    ax_bot.set_ylabel("Количество (накопленно)")
-    ax_bot.set_title("Абсолютные счётчики группы A в зависимости от её размера",
+    ax_bot.set_ylabel("Количество")
+    ax_bot.set_title("Абсолютные счётчики: группа A vs группа B",
                      fontsize=12, fontweight="bold")
     _add_milestones(ax_bot, milestones, n)
     _style_x(ax_bot)
-    ax_bot.legend(loc="upper left", fontsize=9)
+    _ab_legend(ax_bot, cnt_specs, loc="center right", ncol=1)
 
-    title = ("Метрики группы A (таргетинг по uplift) в зависимости от размера группы"
+    title = ("Сравнение групп A и B в зависимости от размера группы A"
              + (" — с покупками" if with_purch else ""))
     fig.suptitle(title, fontsize=15, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -159,24 +203,26 @@ def plot_chart(metrics: dict, milestones: list[int], with_purch: bool, out_path:
 
 
 def milestone_table(metrics: dict, milestones: list[int], has_purch: bool) -> pd.DataFrame:
-    n = int(metrics["k"][-1])
+    """Метрики обеих групп (A=топ-m, B=остальные) на ключевых размерах m."""
+    n = metrics["n"]
+    valid = np.array([m for m in milestones if 1 <= m <= n], dtype=int)
+    if valid.size == 0:
+        return pd.DataFrame([{"note": "все milestone превышают число email"}])
+    ab = _ab_at(metrics, valid, has_purch)
     rows = []
-    for m in milestones:
-        if m > n:
-            rows.append({"group_A_size": m, "note": "превышает число email"})
-            continue
-        i = m - 1
-        row = {
-            "group_A_size": m,
-            "clicks": int(metrics["clicks"][i]),
-            "open_rate": round(float(metrics["open_rate"][i]), 4),
-            "click_rate": round(float(metrics["click_rate"][i]), 4),
-            "ctor": round(float(metrics["ctor"][i]), 4),
-        }
-        if has_purch:
-            row["purchases"] = int(metrics["purchases"][i])
-            row["conversion"] = round(float(metrics["conversion"][i]), 4)
-        rows.append(row)
+    for j, m in enumerate(valid):
+        for gi, grp in enumerate(("A", "B")):
+            row = {
+                "group_A_size": m, "group": grp,
+                "clicks": int(ab["clicks"][gi][j]),
+                "open_rate": round(float(ab["open_rate"][gi][j]), 4),
+                "click_rate": round(float(ab["click_rate"][gi][j]), 4),
+                "ctor": round(float(ab["ctor"][gi][j]), 4),
+            }
+            if has_purch:
+                row["purchases"] = int(ab["purchases"][gi][j])
+                row["conversion"] = round(float(ab["conversion"][gi][j]), 4)
+            rows.append(row)
     return pd.DataFrame(rows)
 
 

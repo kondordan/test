@@ -77,12 +77,14 @@ python plot_campaign_results.py --results res.csv --milestones "10000,30000,8000
 Ожидаемые колонки: `email, mean_predicted_uplift, open_date, click_date`
 (+ опционально `claim_id`). Открытие — `open_date > 0`, клик — `click_date > 0`,
 покупка — `claim_id > 0`. По оси X — размер группы A (число верхних по uplift
-email); метрики считаются по группе A и нормируются на её размер: OpenRate,
-ClickRate, CTOR, количество кликов; при наличии `claim_id` — ещё количество
-покупок и Conversion (покупки / размер группы). Вертикальными линиями отмечены
-размеры группы A: **10/30/80/95 тыс.** (настраивается `--milestones`).
-Сохраняются `outputs/campaign_engagement.png` и
-`outputs/campaign_engagement_with_purchases.png`.
+email). На каждом размере **сравниваются группа A (топ‑k, сплошная линия) и
+группа B (остальные n−k, пунктир)** по метрикам: OpenRate, ClickRate, CTOR,
+кол-во кликов; при наличии `claim_id` — ещё кол-во покупок и Conversion
+(покупки / размер группы). Вертикальными линиями отмечены размеры группы A:
+**10/30/80/95 тыс.** (настраивается `--milestones`). В легенде: цвет = метрика,
+сплошная = A, пунктир = B. Сохраняются `outputs/campaign_engagement.png` и
+`outputs/campaign_engagement_with_purchases.png`; в консоль печатается таблица
+метрик A и B на ключевых размерах.
 
 ### Балансировка обучающей выборки (опционально)
 
