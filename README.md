@@ -66,19 +66,22 @@ python predict.py --comm comm.csv --purch purchases.csv \
 
 ### Графики результатов кампании (A/B)
 
-После проведения кампании (есть факт открытий/кликов/покупок) можно построить
-наглядные сравнительные графики «группа A (отправили рекомендацию, `flag=ИСТИНА`)
-против группы B (`ЛОЖЬ`)»:
+Строятся графики **метрик в зависимости от размера группы A**, где группа A — это
+email с самыми большими `mean_predicted_uplift` (топ-k), остальные — группа B:
 
 ```bash
 python plot_campaign_results.py --results outputs/campaign_results.csv
+python plot_campaign_results.py --results res.csv --milestones "10000,30000,80000,95000"
 ```
 
-Ожидаемые колонки: `email, flag, open_date, click_date` (+ опционально `claim`).
-Открытие — `open_date > 0`, клик — `click_date > 0`, покупка — `claim > 0`.
-Метрики нормируются на число уникальных email в группе: уник. email, клики,
-OpenRate, ClickRate, CTOR; при наличии `claim` — ещё покупки и Conversion
-(покупки / размер группы). Сохраняются `outputs/campaign_engagement.png` и
+Ожидаемые колонки: `email, mean_predicted_uplift, open_date, click_date`
+(+ опционально `claim_id`). Открытие — `open_date > 0`, клик — `click_date > 0`,
+покупка — `claim_id > 0`. По оси X — размер группы A (число верхних по uplift
+email); метрики считаются по группе A и нормируются на её размер: OpenRate,
+ClickRate, CTOR, количество кликов; при наличии `claim_id` — ещё количество
+покупок и Conversion (покупки / размер группы). Вертикальными линиями отмечены
+размеры группы A: **10/30/80/95 тыс.** (настраивается `--milestones`).
+Сохраняются `outputs/campaign_engagement.png` и
 `outputs/campaign_engagement_with_purchases.png`.
 
 ### Балансировка обучающей выборки (опционально)
